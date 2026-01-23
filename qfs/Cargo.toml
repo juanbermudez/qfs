@@ -1,0 +1,53 @@
+[package]
+name = "qfs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "QFS core library - file indexing, search, and MCP server"
+readme = "../README.md"
+
+[dependencies]
+# SQLite with FTS5
+rusqlite = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# File system
+walkdir = { workspace = true }
+glob = { workspace = true }
+notify = { workspace = true }
+
+# Hashing
+sha2 = { workspace = true }
+
+# Content detection
+mime_guess = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Regex
+regex = { workspace = true }
+
+# Directories
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+assert_fs = { workspace = true }
+predicates = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
