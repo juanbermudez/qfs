@@ -94,7 +94,6 @@ pub struct SearchResult {
 
 /// Searcher for QFS
 pub struct Searcher<'a> {
-    #[allow(dead_code)]
     store: &'a Store,
 }
 
@@ -122,73 +121,62 @@ impl<'a> Searcher<'a> {
             return Ok(Vec::new());
         }
 
-        // Build SQL query (prepared for actual implementation in task-002)
-        let _sql = if let Some(ref _collection) = options.collection {
-            format!(
-                r#"
-                SELECT
-                    d.id,
-                    d.collection,
-                    d.path,
-                    d.title,
-                    d.hash,
-                    d.file_type,
-                    c.content_type,
-                    c.size,
-                    bm25(documents_fts) as bm25_score,
-                    snippet(documents_fts, 2, '<mark>', '</mark>', '...', 64) as snippet
-                FROM documents_fts
-                JOIN documents d ON d.id = documents_fts.rowid
-                JOIN content c ON c.hash = d.hash
-                WHERE documents_fts MATCH ?1
-                  AND d.collection = ?2
-                  AND d.active = 1
-                ORDER BY bm25_score
-                LIMIT ?3
-                "#
-            )
-        } else {
-            format!(
-                r#"
-                SELECT
-                    d.id,
-                    d.collection,
-                    d.path,
-                    d.title,
-                    d.hash,
-                    d.file_type,
-                    c.content_type,
-                    c.size,
-                    bm25(documents_fts) as bm25_score,
-                    snippet(documents_fts, 2, '<mark>', '</mark>', '...', 64) as snippet
-                FROM documents_fts
-                JOIN documents d ON d.id = documents_fts.rowid
-                JOIN content c ON c.hash = d.hash
-                WHERE documents_fts MATCH ?1
-                  AND d.active = 1
-                ORDER BY bm25_score
-                LIMIT ?2
-                "#
-            )
-        };
+        // Execute search via Store
+        let rows = self.store.search_bm25(
+            &fts_query,
+            options.collection.as_deref(),
+            options.limit,
+            options.include_binary,
+        )?;
 
-        // Get connection from store (we need internal access)
-        // For now, we'll use a workaround by re-opening the database
-        // In production, Store would expose the connection
+        // Convert rows to SearchResults with score normalization
+        let results: Vec<SearchResult> = rows
+            .into_iter()
+            .map(|row| {
+                let normalized_score = normalize_bm25_score(row.bm25_score);
 
-        // Actually, let's add a search method to Store instead
-        self.execute_bm25_search(&fts_query, options)
-    }
+                // Determine if binary
+                let is_binary = row.content_type.starts_with("application/octet")
+                    || row.content_type.starts_with("image/")
+                    || row.content_type.starts_with("audio/")
+                    || row.content_type.starts_with("video/");
 
-    /// Execute BM25 search
-    fn execute_bm25_search(&self, _fts_query: &str, _options: &SearchOptions) -> Result<Vec<SearchResult>> {
-        // We need access to the connection - Store should expose this
-        // For now, we'll add this to Store
+                // Extract filename from path
+                let name = std::path::Path::new(&row.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&row.path)
+                    .to_string();
 
-        // This is a placeholder - actual implementation will be in Store
-        // when we refactor to give Searcher proper access
+                // Build content pointer for binary files
+                let content_pointer = if is_binary {
+                    // Would need collection path to build file:// URL
+                    // For now, return the relative path
+                    Some(format!("{}/{}", row.collection, row.path))
+                } else {
+                    None
+                };
 
-        Ok(Vec::new())
+                SearchResult {
+                    id: row.id,
+                    path: format!("{}/{}", row.collection, row.path),
+                    name,
+                    mime_type: row.content_type,
+                    file_size: row.size,
+                    is_binary,
+                    score: normalized_score,
+                    content: None, // Content loaded separately if needed
+                    content_pointer,
+                    snippet: row.snippet,
+                    line_start: None, // Could parse from snippet
+                    collection: row.collection,
+                    title: row.title,
+                }
+            })
+            .filter(|r| r.score >= options.min_score)
+            .collect();
+
+        Ok(results)
     }
 }
 
@@ -246,7 +234,6 @@ fn sanitize_fts_query(query: &str) -> String {
 ///
 /// FTS5 BM25 returns negative scores where lower is better.
 /// This converts to 0-1 where higher is better.
-#[allow(dead_code)]
 pub fn normalize_bm25_score(bm25_score: f64) -> f64 {
     1.0 / (1.0 + bm25_score.abs())
 }

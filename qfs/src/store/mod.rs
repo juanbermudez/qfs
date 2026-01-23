@@ -44,6 +44,21 @@ pub struct Collection {
     pub updated_at: String,
 }
 
+/// Row returned from BM25 search query
+#[derive(Debug, Clone)]
+pub struct SearchResultRow {
+    pub id: i64,
+    pub collection: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub hash: String,
+    pub file_type: String,
+    pub content_type: String,
+    pub size: i64,
+    pub bm25_score: f64,
+    pub snippet: Option<String>,
+}
+
 /// Content stored in content-addressable storage
 #[derive(Debug, Clone)]
 pub struct Content {
@@ -426,6 +441,113 @@ impl Store {
         Ok(count)
     }
 
+    // -------------------------------------------------------------------------
+    // Search operations
+    // -------------------------------------------------------------------------
+
+    /// Execute BM25 full-text search
+    pub fn search_bm25(
+        &self,
+        fts_query: &str,
+        collection: Option<&str>,
+        limit: usize,
+        include_binary: bool,
+    ) -> Result<Vec<SearchResultRow>> {
+        let mut results = Vec::new();
+
+        if fts_query.is_empty() {
+            return Ok(results);
+        }
+
+        let sql = if collection.is_some() {
+            r#"
+            SELECT
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.hash,
+                d.file_type,
+                c.content_type,
+                c.size,
+                bm25(documents_fts) as bm25_score,
+                snippet(documents_fts, 2, '<mark>', '</mark>', '...', 64) as snippet
+            FROM documents_fts
+            JOIN documents d ON d.id = documents_fts.rowid
+            JOIN content c ON c.hash = d.hash
+            WHERE documents_fts MATCH ?1
+              AND d.collection = ?2
+              AND d.active = 1
+            ORDER BY bm25_score
+            LIMIT ?3
+            "#
+        } else {
+            r#"
+            SELECT
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.hash,
+                d.file_type,
+                c.content_type,
+                c.size,
+                bm25(documents_fts) as bm25_score,
+                snippet(documents_fts, 2, '<mark>', '</mark>', '...', 64) as snippet
+            FROM documents_fts
+            JOIN documents d ON d.id = documents_fts.rowid
+            JOIN content c ON c.hash = d.hash
+            WHERE documents_fts MATCH ?1
+              AND d.active = 1
+            ORDER BY bm25_score
+            LIMIT ?2
+            "#
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        // Helper closure to map row to SearchResultRow
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<SearchResultRow> {
+            Ok(SearchResultRow {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                path: row.get(2)?,
+                title: row.get(3)?,
+                hash: row.get(4)?,
+                file_type: row.get(5)?,
+                content_type: row.get(6)?,
+                size: row.get(7)?,
+                bm25_score: row.get(8)?,
+                snippet: row.get(9)?,
+            })
+        };
+
+        // Execute query with appropriate parameters
+        let mut query_rows = if let Some(coll) = collection {
+            stmt.query(params![fts_query, coll, limit as i64])?
+        } else {
+            stmt.query(params![fts_query, limit as i64])?
+        };
+
+        while let Some(row) = query_rows.next()? {
+            let result = map_row(row)?;
+
+            // Skip binary files unless requested
+            let is_binary = result.content_type.starts_with("application/octet")
+                || result.content_type.starts_with("image/")
+                || result.content_type.starts_with("audio/")
+                || result.content_type.starts_with("video/");
+
+            if is_binary && !include_binary {
+                continue;
+            }
+
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
     /// Get database file size in bytes
     pub fn database_size(&self) -> Result<u64> {
         if self.path.to_str() == Some(":memory:") {
@@ -523,5 +645,42 @@ mod tests {
         // Deactivate
         store.deactivate_document("test", "hello.md").unwrap();
         assert_eq!(store.count_documents(Some("test")).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_search_bm25() {
+        let store = Store::open_memory().unwrap();
+
+        // Add collection
+        store.add_collection("test", "/tmp/test", &["**/*.md"]).unwrap();
+
+        // Insert content and documents
+        store.insert_content("hash1", b"# Rust Programming\n\nRust is a systems programming language.", "text/markdown").unwrap();
+        store.insert_content("hash2", b"# Python Tutorial\n\nPython is a dynamic language.", "text/markdown").unwrap();
+        store.insert_content("hash3", b"# JavaScript Guide\n\nJavaScript runs in browsers.", "text/markdown").unwrap();
+
+        store.upsert_document("test", "rust.md", Some("Rust Programming"), "hash1", ".md", "Rust Programming Rust is a systems programming language").unwrap();
+        store.upsert_document("test", "python.md", Some("Python Tutorial"), "hash2", ".md", "Python Tutorial Python is a dynamic language").unwrap();
+        store.upsert_document("test", "javascript.md", Some("JavaScript Guide"), "hash3", ".md", "JavaScript Guide JavaScript runs in browsers").unwrap();
+
+        // Search for "rust"
+        let results = store.search_bm25("\"rust\"*", None, 10, false).unwrap();
+        assert!(!results.is_empty(), "Should find results for 'rust'");
+        assert_eq!(results[0].path, "rust.md");
+
+        // Search for "programming"
+        let results = store.search_bm25("\"programming\"*", None, 10, false).unwrap();
+        assert!(!results.is_empty(), "Should find results for 'programming'");
+
+        // Search for "language"
+        let results = store.search_bm25("\"language\"*", None, 10, false).unwrap();
+        assert_eq!(results.len(), 2, "Should find 2 results for 'language'");
+
+        // Search with collection filter
+        let results = store.search_bm25("\"rust\"*", Some("test"), 10, false).unwrap();
+        assert!(!results.is_empty());
+
+        let results = store.search_bm25("\"rust\"*", Some("nonexistent"), 10, false).unwrap();
+        assert!(results.is_empty());
     }
 }
