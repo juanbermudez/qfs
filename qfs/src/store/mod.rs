@@ -362,11 +362,50 @@ impl Store {
 
     /// Mark a document as inactive (soft delete)
     pub fn deactivate_document(&self, collection: &str, path: &str) -> Result<()> {
+        // First get the document ID to remove from FTS
+        if let Ok(doc) = self.get_document(collection, path) {
+            // Remove from FTS index
+            self.conn.execute(
+                "DELETE FROM documents_fts WHERE rowid = ?1",
+                [doc.id],
+            )?;
+        }
+
         self.conn.execute(
             "UPDATE documents SET active = 0 WHERE collection = ?1 AND path = ?2",
             [collection, path],
         )?;
         Ok(())
+    }
+
+    /// List all documents in a collection
+    pub fn list_documents(&self, collection: &str) -> Result<Vec<Document>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
+             FROM documents WHERE collection = ?1 AND active = 1
+             ORDER BY path"
+        )?;
+
+        let docs = stmt.query_map([collection], |row| {
+            Ok(Document {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                path: row.get(2)?,
+                title: row.get(3)?,
+                hash: row.get(4)?,
+                file_type: row.get(5)?,
+                created_at: row.get(6)?,
+                modified_at: row.get(7)?,
+                indexed_at: row.get(8)?,
+                active: row.get(9)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for doc in docs {
+            result.push(doc?);
+        }
+        Ok(result)
     }
 
     /// Count documents in a collection

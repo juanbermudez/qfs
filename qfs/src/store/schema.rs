@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS index_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Note: FTS5 doesn't support traditional triggers, so we sync manually
+-- in the application code using DELETE + INSERT pattern.
+-- This is the recommended approach for FTS5 external content.
 "#;
 
 /// Ensure the database schema is up to date
