@@ -7,8 +7,8 @@ license.workspace = true
 description = "QFS embedding generation (optional feature)"
 
 [dependencies]
-# Will add fastembed when implementing Phase 2
-# fastembed = "4.0"
+# Embeddings
+fastembed = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

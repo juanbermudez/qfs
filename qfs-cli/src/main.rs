@@ -1,5 +1,7 @@
 //! QFS CLI - Quick File Search command-line interface
 
+mod mcp;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use qfs::{Indexer, SearchMode, SearchOptions, Store};
@@ -351,8 +353,7 @@ fn cmd_status(db_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(_db_path: &PathBuf) -> Result<()> {
-    println!("MCP server not yet implemented. Coming in Phase 3.");
-    // TODO: Implement MCP server with stdio transport
-    Ok(())
+fn cmd_serve(db_path: &PathBuf) -> Result<()> {
+    let server = mcp::McpServer::new(db_path)?;
+    server.run()
 }

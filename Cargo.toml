@@ -17,6 +17,9 @@ categories = ["command-line-utilities", "database", "text-processing"]
 # SQLite and search (bundled includes FTS5 by default)
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Embeddings (optional)
+fastembed = "4"
+
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
 

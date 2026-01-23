@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::store::Store;
+use std::collections::HashMap;
 
 /// Search mode
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -90,6 +91,9 @@ pub struct SearchResult {
     /// Document title
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Chunk index for vector search results
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_index: Option<i32>,
 }
 
 /// Searcher for QFS
@@ -107,8 +111,8 @@ impl<'a> Searcher<'a> {
     pub fn search(&self, query: &str, options: SearchOptions) -> Result<Vec<SearchResult>> {
         match options.mode {
             SearchMode::Bm25 => self.search_bm25(query, &options),
-            SearchMode::Vector => Err(Error::EmbeddingsRequired),
-            SearchMode::Hybrid => Err(Error::EmbeddingsRequired),
+            SearchMode::Vector => self.search_vector(query, &options),
+            SearchMode::Hybrid => self.search_hybrid(query, &options),
         }
     }
 
@@ -171,6 +175,7 @@ impl<'a> Searcher<'a> {
                     line_start: None, // Could parse from snippet
                     collection: row.collection,
                     title: row.title,
+                    chunk_index: None,
                 }
             })
             .filter(|r| r.score >= options.min_score)
@@ -178,6 +183,177 @@ impl<'a> Searcher<'a> {
 
         Ok(results)
     }
+
+    /// Vector semantic search
+    fn search_vector(&self, _query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
+        // Check if any embeddings exist
+        let embed_count = self.store.count_embeddings(options.collection.as_deref())?;
+        if embed_count == 0 {
+            return Err(Error::EmbeddingsRequired);
+        }
+
+        // For vector search, we need the query embedding
+        // This would be provided externally or computed here
+        // For now, return an error indicating embeddings are needed
+        // The actual search happens in search_vector_with_embedding
+        Err(Error::EmbeddingError(
+            "Vector search requires query embedding. Use search_vector_with_embedding() instead.".to_string()
+        ))
+    }
+
+    /// Vector search with pre-computed query embedding
+    pub fn search_vector_with_embedding(
+        &self,
+        query_embedding: &[f32],
+        options: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        // Get all embeddings
+        let embeddings = self.store.get_all_embeddings_for_search(options.collection.as_deref())?;
+
+        if embeddings.is_empty() {
+            return Err(Error::EmbeddingsRequired);
+        }
+
+        // Calculate similarities
+        let mut scored: Vec<(f64, &crate::store::EmbeddingSearchRow)> = embeddings
+            .iter()
+            .map(|row| {
+                let embedding = bytes_to_embedding(&row.embedding);
+                let similarity = cosine_similarity(query_embedding, &embedding);
+                (similarity as f64, row)
+            })
+            .collect();
+
+        // Sort by similarity (descending)
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Take top results
+        let results: Vec<SearchResult> = scored
+            .into_iter()
+            .take(options.limit)
+            .filter(|(score, _)| *score >= options.min_score)
+            .map(|(score, row)| {
+                let name = std::path::Path::new(&row.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&row.path)
+                    .to_string();
+
+                SearchResult {
+                    id: row.doc_id,
+                    path: format!("{}/{}", row.collection, row.path),
+                    name,
+                    mime_type: "text/plain".to_string(), // We'd need to look this up
+                    file_size: 0,
+                    is_binary: false,
+                    score,
+                    content: None,
+                    content_pointer: None,
+                    snippet: None,
+                    line_start: None,
+                    collection: row.collection.clone(),
+                    title: row.title.clone(),
+                    chunk_index: Some(row.chunk_index),
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Hybrid search combining BM25 and vector with RRF
+    fn search_hybrid(&self, _query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
+        // Check if embeddings are available
+        let embed_count = self.store.count_embeddings(options.collection.as_deref())?;
+        if embed_count == 0 {
+            return Err(Error::EmbeddingsRequired);
+        }
+
+        // For hybrid search, we need the query embedding
+        // This would be provided externally
+        Err(Error::EmbeddingError(
+            "Hybrid search requires query embedding. Use search_hybrid_with_embedding() instead.".to_string()
+        ))
+    }
+
+    /// Hybrid search with pre-computed query embedding
+    pub fn search_hybrid_with_embedding(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        options: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        // Get BM25 results
+        let bm25_options = SearchOptions {
+            limit: options.limit * 2, // Get more for fusion
+            ..options.clone()
+        };
+        let bm25_results = self.search_bm25(query, &bm25_options)?;
+
+        // Get vector results
+        let vector_options = SearchOptions {
+            limit: options.limit * 2,
+            ..options.clone()
+        };
+        let vector_results = self.search_vector_with_embedding(query_embedding, &vector_options)?;
+
+        // Apply Reciprocal Rank Fusion (RRF)
+        let fused = reciprocal_rank_fusion(&bm25_results, &vector_results, 60.0);
+
+        // Take top results
+        Ok(fused.into_iter().take(options.limit).collect())
+    }
+}
+
+/// Apply Reciprocal Rank Fusion (RRF) to combine two result sets
+///
+/// RRF score = 1 / (k + rank)
+/// where k is a constant (typically 60)
+fn reciprocal_rank_fusion(
+    bm25_results: &[SearchResult],
+    vector_results: &[SearchResult],
+    k: f64,
+) -> Vec<SearchResult> {
+    let mut scores: HashMap<i64, (f64, Option<SearchResult>)> = HashMap::new();
+
+    // Add BM25 scores
+    for (rank, result) in bm25_results.iter().enumerate() {
+        let rrf_score = 1.0 / (k + rank as f64 + 1.0);
+        scores
+            .entry(result.id)
+            .or_insert((0.0, None))
+            .0 += rrf_score;
+        if scores[&result.id].1.is_none() {
+            scores.get_mut(&result.id).unwrap().1 = Some(result.clone());
+        }
+    }
+
+    // Add vector scores
+    for (rank, result) in vector_results.iter().enumerate() {
+        let rrf_score = 1.0 / (k + rank as f64 + 1.0);
+        scores
+            .entry(result.id)
+            .or_insert((0.0, None))
+            .0 += rrf_score;
+        if scores[&result.id].1.is_none() {
+            scores.get_mut(&result.id).unwrap().1 = Some(result.clone());
+        }
+    }
+
+    // Sort by combined score
+    let mut results: Vec<_> = scores
+        .into_iter()
+        .filter_map(|(_, (score, result))| {
+            result.map(|mut r| {
+                r.score = score;
+                r
+            })
+        })
+        .collect();
+
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    results
 }
 
 /// Sanitize a query string for FTS5
@@ -238,6 +414,34 @@ pub fn normalize_bm25_score(bm25_score: f64) -> f64 {
     1.0 / (1.0 + bm25_score.abs())
 }
 
+/// Convert bytes to f32 embedding
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let arr: [u8; 4] = chunk.try_into().unwrap();
+            f32::from_le_bytes(arr)
+        })
+        .collect()
+}
+
+/// Calculate cosine similarity between two embeddings
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot / (norm_a * norm_b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +482,119 @@ mod tests {
         assert_eq!("vector".parse::<SearchMode>().unwrap(), SearchMode::Vector);
         assert_eq!("hybrid".parse::<SearchMode>().unwrap(), SearchMode::Hybrid);
         assert!("invalid".parse::<SearchMode>().is_err());
+    }
+
+    #[test]
+    fn test_cosine_similarity_identical() {
+        let a = vec![1.0, 2.0, 3.0];
+        let sim = cosine_similarity(&a, &a);
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bytes_to_embedding() {
+        let embedding = vec![1.0f32, 2.0, -3.5];
+        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let restored = bytes_to_embedding(&bytes);
+
+        assert_eq!(embedding.len(), restored.len());
+        for (a, b) in embedding.iter().zip(restored.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_reciprocal_rank_fusion() {
+        let bm25 = vec![
+            SearchResult {
+                id: 1,
+                path: "a.md".to_string(),
+                name: "a.md".to_string(),
+                mime_type: "text/markdown".to_string(),
+                file_size: 100,
+                is_binary: false,
+                score: 0.9,
+                content: None,
+                content_pointer: None,
+                snippet: None,
+                line_start: None,
+                collection: "test".to_string(),
+                title: None,
+                chunk_index: None,
+            },
+            SearchResult {
+                id: 2,
+                path: "b.md".to_string(),
+                name: "b.md".to_string(),
+                mime_type: "text/markdown".to_string(),
+                file_size: 100,
+                is_binary: false,
+                score: 0.8,
+                content: None,
+                content_pointer: None,
+                snippet: None,
+                line_start: None,
+                collection: "test".to_string(),
+                title: None,
+                chunk_index: None,
+            },
+        ];
+
+        let vector = vec![
+            SearchResult {
+                id: 2,
+                path: "b.md".to_string(),
+                name: "b.md".to_string(),
+                mime_type: "text/markdown".to_string(),
+                file_size: 100,
+                is_binary: false,
+                score: 0.95,
+                content: None,
+                content_pointer: None,
+                snippet: None,
+                line_start: None,
+                collection: "test".to_string(),
+                title: None,
+                chunk_index: None,
+            },
+            SearchResult {
+                id: 3,
+                path: "c.md".to_string(),
+                name: "c.md".to_string(),
+                mime_type: "text/markdown".to_string(),
+                file_size: 100,
+                is_binary: false,
+                score: 0.85,
+                content: None,
+                content_pointer: None,
+                snippet: None,
+                line_start: None,
+                collection: "test".to_string(),
+                title: None,
+                chunk_index: None,
+            },
+        ];
+
+        let fused = reciprocal_rank_fusion(&bm25, &vector, 60.0);
+
+        // Document 2 appears in both, should be ranked higher
+        assert_eq!(fused.len(), 3);
+
+        // Find doc 2's score - it should have contributions from both rankings
+        let doc2 = fused.iter().find(|r| r.id == 2).unwrap();
+        let doc1 = fused.iter().find(|r| r.id == 1).unwrap();
+        let doc3 = fused.iter().find(|r| r.id == 3).unwrap();
+
+        // Doc 2 should have higher score since it's in both result sets
+        assert!(doc2.score > doc1.score);
+        assert!(doc2.score > doc3.score);
     }
 }

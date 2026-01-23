@@ -556,6 +556,187 @@ impl Store {
         let metadata = std::fs::metadata(&self.path)?;
         Ok(metadata.len())
     }
+
+    // -------------------------------------------------------------------------
+    // Embedding operations
+    // -------------------------------------------------------------------------
+
+    /// Insert embeddings for a document chunk
+    pub fn insert_embedding(
+        &self,
+        hash: &str,
+        chunk_index: i32,
+        char_offset: i32,
+        model: &str,
+        embedding: &[u8],
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO embeddings (hash, chunk_index, char_offset, model, embedding, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![hash, chunk_index, char_offset, model, embedding, now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get all embeddings for a document hash
+    pub fn get_embeddings(&self, hash: &str) -> Result<Vec<EmbeddingRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hash, chunk_index, char_offset, model, embedding, created_at
+             FROM embeddings WHERE hash = ?1 ORDER BY chunk_index"
+        )?;
+
+        let mut results = Vec::new();
+        let mut rows = stmt.query([hash])?;
+
+        while let Some(row) = rows.next()? {
+            results.push(EmbeddingRow {
+                hash: row.get(0)?,
+                chunk_index: row.get(1)?,
+                char_offset: row.get(2)?,
+                model: row.get(3)?,
+                embedding: row.get(4)?,
+                created_at: row.get(5)?,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Check if embeddings exist for a document hash
+    pub fn has_embeddings(&self, hash: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM embeddings WHERE hash = ?1",
+            [hash],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Delete embeddings for a document hash
+    pub fn delete_embeddings(&self, hash: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM embeddings WHERE hash = ?1",
+            [hash],
+        )?;
+        Ok(())
+    }
+
+    /// Count documents with embeddings
+    pub fn count_embeddings(&self, collection: Option<&str>) -> Result<i64> {
+        let count: i64 = if let Some(coll) = collection {
+            self.conn.query_row(
+                "SELECT COUNT(DISTINCT e.hash)
+                 FROM embeddings e
+                 JOIN documents d ON d.hash = e.hash
+                 WHERE d.collection = ?1 AND d.active = 1",
+                [coll],
+                |row| row.get(0),
+            )?
+        } else {
+            self.conn.query_row(
+                "SELECT COUNT(DISTINCT hash) FROM embeddings",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        Ok(count)
+    }
+
+    /// Get all embeddings for vector search
+    /// Returns embeddings joined with document info
+    pub fn get_all_embeddings_for_search(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<EmbeddingSearchRow>> {
+        let sql = if collection.is_some() {
+            r#"
+            SELECT
+                e.hash,
+                e.chunk_index,
+                e.char_offset,
+                e.embedding,
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.file_type
+            FROM embeddings e
+            JOIN documents d ON d.hash = e.hash
+            WHERE d.collection = ?1 AND d.active = 1
+            ORDER BY d.id, e.chunk_index
+            "#
+        } else {
+            r#"
+            SELECT
+                e.hash,
+                e.chunk_index,
+                e.char_offset,
+                e.embedding,
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.file_type
+            FROM embeddings e
+            JOIN documents d ON d.hash = e.hash
+            WHERE d.active = 1
+            ORDER BY d.id, e.chunk_index
+            "#
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut results = Vec::new();
+
+        let mut rows = if let Some(coll) = collection {
+            stmt.query([coll])?
+        } else {
+            stmt.query([])?
+        };
+
+        while let Some(row) = rows.next()? {
+            results.push(EmbeddingSearchRow {
+                hash: row.get(0)?,
+                chunk_index: row.get(1)?,
+                char_offset: row.get(2)?,
+                embedding: row.get(3)?,
+                doc_id: row.get(4)?,
+                collection: row.get(5)?,
+                path: row.get(6)?,
+                title: row.get(7)?,
+                file_type: row.get(8)?,
+            });
+        }
+
+        Ok(results)
+    }
+}
+
+/// Row from embeddings table
+#[derive(Debug, Clone)]
+pub struct EmbeddingRow {
+    pub hash: String,
+    pub chunk_index: i32,
+    pub char_offset: i32,
+    pub model: String,
+    pub embedding: Vec<u8>,
+    pub created_at: String,
+}
+
+/// Row for embedding search (joined with document info)
+#[derive(Debug, Clone)]
+pub struct EmbeddingSearchRow {
+    pub hash: String,
+    pub chunk_index: i32,
+    pub char_offset: i32,
+    pub embedding: Vec<u8>,
+    pub doc_id: i64,
+    pub collection: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub file_type: String,
 }
 
 #[cfg(test)]
