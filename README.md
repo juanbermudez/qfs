@@ -194,8 +194,8 @@ cargo build --release
 ## Roadmap
 
 - [x] **Phase 1**: Core BM25 search, CLI
-- [ ] **Phase 2**: Vector embeddings (fastembed), hybrid search
-- [ ] **Phase 3**: MCP server, AI agent integration
+- [x] **Phase 2**: Vector embeddings (fastembed), hybrid search
+- [x] **Phase 3**: MCP server, AI agent integration
 - [ ] **Phase 4**: Hypercraft desktop integration
 
 ## License
