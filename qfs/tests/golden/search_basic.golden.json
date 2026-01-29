@@ -1,0 +1,79 @@
+[
+  {
+    "query": "rust",
+    "mode": "bm25",
+    "min_count": 4,
+    "max_count": 7,
+    "top_results": [
+      {
+        "path_contains": "rust-guide.md",
+        "min_score": 0.8,
+        "max_rank": 3
+      },
+      {
+        "path_contains": "memory-management.md",
+        "min_score": 0.8,
+        "max_rank": 4
+      },
+      {
+        "path_contains": "search-engine.rs",
+        "min_score": 0.8,
+        "max_rank": 5
+      }
+    ]
+  },
+  {
+    "query": "async await",
+    "mode": "bm25",
+    "min_count": 2,
+    "max_count": 5,
+    "top_results": [
+      {
+        "path_contains": "async-await.md",
+        "min_score": 0.32,
+        "max_rank": 3
+      },
+      {
+        "path_contains": "rust-guide.md",
+        "min_score": 0.36,
+        "max_rank": 4
+      },
+      {
+        "path_contains": "typescript-patterns.md",
+        "min_score": 0.42,
+        "max_rank": 5
+      }
+    ]
+  },
+  {
+    "query": "memory safety",
+    "mode": "bm25",
+    "min_count": 1,
+    "max_count": 4,
+    "top_results": [
+      {
+        "path_contains": "rust-guide.md",
+        "min_score": 0.17,
+        "max_rank": 3
+      },
+      {
+        "path_contains": "memory-management.md",
+        "min_score": 0.18,
+        "max_rank": 4
+      }
+    ]
+  },
+  {
+    "query": "typescript",
+    "mode": "bm25",
+    "min_count": 1,
+    "max_count": 3,
+    "top_results": [
+      {
+        "path_contains": "typescript-patterns.md",
+        "min_score": 0.17,
+        "max_rank": 3
+      }
+    ]
+  }
+]

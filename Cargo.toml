@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["qfs", "qfs-cli", "qfs-embed"]
+members = ["qfs", "qfs-cli", "qfs-embed", "qfs-mcp"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,64 @@
+[
+  {
+    "query": "error handling",
+    "mode": "bm25",
+    "min_count": 1,
+    "max_count": null,
+    "top_results": [
+      {
+        "path_contains": "rust-guide.md",
+        "min_score": null,
+        "max_rank": 4
+      },
+      {
+        "path_contains": "async-await.md",
+        "min_score": null,
+        "max_rank": 5
+      },
+      {
+        "path_contains": "api-design.md",
+        "min_score": null,
+        "max_rank": 6
+      }
+    ]
+  },
+  {
+    "query": "database full text search",
+    "mode": "bm25",
+    "min_count": 1,
+    "max_count": null,
+    "top_results": [
+      {
+        "path_contains": "database-fundamentals.md",
+        "min_score": null,
+        "max_rank": 4
+      }
+    ]
+  },
+  {
+    "query": "api design patterns",
+    "mode": "bm25",
+    "min_count": 1,
+    "max_count": null,
+    "top_results": [
+      {
+        "path_contains": "typescript-patterns.md",
+        "min_score": null,
+        "max_rank": 4
+      }
+    ]
+  },
+  {
+    "query": "stack heap memory",
+    "mode": "bm25",
+    "min_count": 1,
+    "max_count": null,
+    "top_results": [
+      {
+        "path_contains": "memory-management.md",
+        "min_score": null,
+        "max_rank": 4
+      }
+    ]
+  }
+]

@@ -34,6 +34,7 @@
 
 pub mod error;
 pub mod indexer;
+pub mod mcp;
 pub mod parser;
 pub mod scanner;
 pub mod search;

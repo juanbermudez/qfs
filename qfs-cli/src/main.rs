@@ -355,5 +355,5 @@ fn cmd_status(db_path: &PathBuf) -> Result<()> {
 
 fn cmd_serve(db_path: &PathBuf) -> Result<()> {
     let server = mcp::McpServer::new(db_path)?;
-    server.run()
+    Ok(server.run()?)
 }

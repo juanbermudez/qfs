@@ -1,281 +1,314 @@
 # QFS - Quick File Search
 
-An on-device search engine for all your local files. Index your notes, code, documentation, and knowledge bases. Search with keywords or semantic similarity—all running locally.
+An on-device search engine for everything you need to remember. Index your notes, code, documentation, and knowledge bases. Search with keywords or semantic similarity. Ideal for your agentic flows.
 
-QFS combines **BM25 full-text search**, **vector semantic search**, and **hybrid ranking** using Reciprocal Rank Fusion (RRF). Built in Rust for speed, powered by SQLite FTS5 and [fastembed](https://github.com/Anush008/fastembed-rs) for embeddings.
+QFS combines BM25 full-text search, vector semantic search, and hybrid ranking using Reciprocal Rank Fusion (RRF)—all running locally. Built in Rust for speed with minimal dependencies.
+
+This is a Rust port of [QMD](https://github.com/tobi/qmd) by [Tobi Lütke](https://github.com/tobi). All credit for the original design and implementation goes to him.
 
 ## Quick Start
 
-```bash
+```sh
 # Install from source
 cargo install --path qfs-cli
 
-# Initialize and index your files
-qfs init
+# Create collections for your notes, docs, and code
 qfs add notes ~/notes --patterns "**/*.md"
+qfs add docs ~/Documents --patterns "**/*.md" "**/*.txt"
 qfs add code ~/projects --patterns "**/*.rs" "**/*.ts" "**/*.py"
+
+# Generate embeddings for semantic search
 qfs index
 
-# Search
-qfs search "async error handling"
+# Search across everything
+qfs search "project timeline"              # Fast keyword search
+qfs search "how to deploy" --mode vector   # Semantic search
+qfs search "quarterly planning" --mode hybrid  # Hybrid (best quality)
+
+# Get a specific document
+qfs get "notes/meeting-2024-01-15.md"
+
+# Search within a specific collection
+qfs search "API" -c code
 ```
 
-**Output:**
-```
-Found 3 results for 'async error handling':
+### Using with AI Agents
 
-1. code/src/api/client.rs (score: 0.892)
-   impl Client {
-       pub <mark>async</mark> fn request(&self) -> Result<Response, <mark>Error</mark>> {
-           // <mark>Error</mark> <mark>handling</mark> for network requests
-       }
-   }
+QFS's `--format json` output is designed for agentic workflows:
 
-2. notes/rust-patterns.md (score: 0.756)
-   ## <mark>Error</mark> <mark>Handling</mark> in <mark>Async</mark> Code
-   When working with futures, propagate errors using the ? operator...
-```
+```sh
+# Get structured results for an LLM
+qfs search "authentication" --format json -n 10
 
-## Search Modes
+# List all relevant files above a threshold
+qfs search "error handling" --min-score 0.3 --format json
 
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `bm25` | Keyword search via SQLite FTS5 | Fast, exact term matching |
-| `vector` | Semantic search via embeddings | Find conceptually similar content |
-| `hybrid` | BM25 + vector with RRF fusion | Best of both worlds |
-
-```bash
-# Keyword search (default)
-qfs search "authentication middleware" --mode bm25
-
-# Semantic search - finds related concepts
-qfs search "how to handle user login" --mode vector
-
-# Hybrid - combines both approaches
-qfs search "secure session management" --mode hybrid
+# Retrieve full document content
+qfs get "docs/api-reference.md"
 ```
 
-## AI Agent Integration (MCP)
+### MCP Server
 
-QFS exposes tools via the [Model Context Protocol](https://modelcontextprotocol.io/) for AI agents like Claude Code, Cursor, and others.
+QFS exposes an MCP (Model Context Protocol) server for tighter integration with AI agents.
 
-```bash
-# Start MCP server (stdio transport)
-qfs serve
-```
+**Tools exposed:**
+- `qfs_search` - Fast BM25 keyword search (supports collection filter)
+- `qfs_vsearch` - Semantic vector search (supports collection filter)
+- `qfs_query` - Hybrid search with RRF fusion (supports collection filter)
+- `qfs_get` - Retrieve document by path
+- `qfs_multi_get` - Retrieve multiple documents by paths
+- `qfs_status` - Index health and collection info
 
-### Claude Code Configuration
-
-Add to `~/.claude/settings.json`:
+**Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "qfs": {
-      "command": "/path/to/qfs",
+      "command": "qfs",
       "args": ["serve"]
     }
   }
 }
 ```
 
-### Available Tools
+**Claude Code configuration** (`~/.claude/settings.json`):
 
-| Tool | Description |
-|------|-------------|
-| `qfs_search` | BM25 keyword search |
-| `qfs_vsearch` | Vector semantic search |
-| `qfs_query` | Hybrid search with RRF reranking |
-| `qfs_get` | Get document by path |
-| `qfs_multi_get` | Batch retrieve multiple documents |
-| `qfs_status` | Index statistics and health |
+```json
+{
+  "mcpServers": {
+    "qfs": {
+      "command": "qfs",
+      "args": ["serve"]
+    }
+  }
+}
+```
 
-### JSON Output for Agents
+## Architecture
 
-```bash
-qfs search "error handling" --format json
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         QFS Hybrid Search Pipeline                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌─────────────────┐
+                              │   User Query    │
+                              └────────┬────────┘
+                                       │
+              ┌────────────────────────┼────────────────────────┐
+              ▼                        │                        ▼
+     ┌─────────────────┐               │               ┌─────────────────┐
+     │   BM25 Search   │               │               │  Vector Search  │
+     │   (SQLite FTS5) │               │               │   (fastembed)   │
+     └────────┬────────┘               │               └────────┬────────┘
+              │                        │                        │
+              │  rank 1: doc_a         │         rank 1: doc_b  │
+              │  rank 2: doc_b         │         rank 2: doc_a  │
+              │  rank 3: doc_c         │         rank 3: doc_d  │
+              │                        │                        │
+              └────────────────────────┼────────────────────────┘
+                                       │
+                                       ▼
+                          ┌───────────────────────┐
+                          │      RRF Fusion       │
+                          │        k=60           │
+                          │  1/(k + rank) scores  │
+                          └───────────┬───────────┘
+                                      │
+                                      ▼
+                              Final ranking:
+                              1. doc_a (0.033)
+                              2. doc_b (0.032)
+                              3. doc_c (0.016)
+                              4. doc_d (0.016)
+```
+
+## Score Normalization
+
+### Search Backends
+
+| Backend | Raw Score | Conversion | Range |
+|---------|-----------|------------|-------|
+| **FTS (BM25)** | SQLite FTS5 BM25 | Normalized to 0-1 | 0.0 to 1.0 |
+| **Vector** | Cosine similarity | Native | 0.0 to 1.0 |
+
+### Score Interpretation
+
+| Score | Meaning |
+|-------|---------|
+| 0.8 - 1.0 | Highly relevant |
+| 0.5 - 0.8 | Moderately relevant |
+| 0.2 - 0.5 | Somewhat relevant |
+| 0.0 - 0.2 | Low relevance |
+
+## Requirements
+
+- Rust 1.70+
+- SQLite 3.35+ (bundled)
+
+## Installation
+
+```sh
+# From source
+git clone https://github.com/yourusername/qfs.git
+cd qfs
+cargo build --release
+cp target/release/qfs /usr/local/bin/
+
+# Or install directly
+cargo install --path qfs-cli
+```
+
+## Usage
+
+### Collection Management
+
+```sh
+# Add a collection with glob patterns
+qfs add notes ~/notes --patterns "**/*.md"
+
+# Add with multiple patterns
+qfs add code ~/projects --patterns "**/*.rs" "**/*.ts" "**/*.py"
+
+# List all collections
+qfs list
+
+# Remove a collection
+qfs remove notes
+```
+
+### Indexing
+
+```sh
+# Index all collections
+qfs index
+
+# Index a specific collection
+qfs index notes
+
+# Show index status
+qfs status
+```
+
+### Search Commands
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        Search Modes                              │
+├──────────┬───────────────────────────────────────────────────────┤
+│ bm25     │ BM25 full-text search only (default)                  │
+│ vector   │ Semantic vector similarity only                       │
+│ hybrid   │ BM25 + Vector with RRF fusion                         │
+└──────────┴───────────────────────────────────────────────────────┘
+```
+
+```sh
+# Full-text search (fast, keyword-based)
+qfs search "authentication flow"
+
+# Vector search (semantic similarity)
+qfs search "how to login" --mode vector
+
+# Hybrid search (best quality)
+qfs search "user authentication" --mode hybrid
+```
+
+### Options
+
+```sh
+# Search options
+-n, --limit <num>        # Number of results (default: 20)
+-m, --mode <mode>        # bm25, vector, hybrid (default: bm25)
+-c, --collection <name>  # Restrict to a collection
+--min-score <num>        # Minimum score threshold (default: 0.0)
+--include-binary         # Include binary files
+-o, --format <format>    # text, json (default: text)
+```
+
+### Output Format
+
+Default output is colorized CLI format:
+
+```
+notes/meeting.md (score: 0.89)
+Title: Q4 Planning
+  Discussion about code quality and **craftsmanship**
+  in the development process.
+
+docs/guide.md (score: 0.67)
+Title: Software Craftsmanship
+  This section covers the **craftsmanship** of building
+  quality software with attention to detail.
+```
+
+JSON output for agents:
+
+```sh
+qfs search "craftsmanship" --format json
 ```
 
 ```json
 {
   "results": [
     {
-      "path": "code/src/error.rs",
-      "score": 0.923,
-      "title": "Error Types",
-      "snippet": "pub enum <mark>Error</mark> { ... }"
+      "path": "notes/meeting.md",
+      "score": 0.89,
+      "title": "Q4 Planning",
+      "snippet": "Discussion about code quality and **craftsmanship**..."
     }
   ],
   "total": 1,
-  "query": "error handling",
+  "query": "craftsmanship",
   "mode": "bm25"
 }
 ```
 
-## CLI Reference
+### Index Maintenance
 
-| Command | Description |
-|---------|-------------|
-| `qfs init` | Initialize database |
-| `qfs add <name> <path>` | Add a collection with glob patterns |
-| `qfs remove <name>` | Remove a collection |
-| `qfs list` | List all collections |
-| `qfs index [name]` | Index all or specific collection |
-| `qfs search <query>` | Search documents |
-| `qfs get <path>` | Get document by path |
-| `qfs status` | Show database statistics |
-| `qfs serve` | Start MCP server |
+```sh
+# Show index status and collections
+qfs status
 
-### Search Options
+# Re-index all collections
+qfs index
 
-```bash
-qfs search "query" [OPTIONS]
-
-Options:
-  -m, --mode <MODE>        bm25, vector, hybrid [default: bm25]
-  -n, --limit <N>          Maximum results [default: 20]
-  -c, --collection <NAME>  Filter by collection
-  --min-score <SCORE>      Minimum score threshold [default: 0.0]
-  --include-binary         Include binary files
-  -o, --format <FORMAT>    text, json [default: text]
+# Get document by path
+qfs get notes/meeting.md
 ```
 
-## Architecture
+## Data Storage
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                         QFS CLI                               │
-└─────────────────────────────┬────────────────────────────────┘
-                              │
-┌─────────────────────────────▼────────────────────────────────┐
-│                        QFS Core                               │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │
-│  │ Scanner  │  │  Parser  │  │ Indexer  │  │   Searcher   │  │
-│  │  (glob)  │  │ (extract)│  │ (hash)   │  │ (BM25+vec)   │  │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────────┘  │
-│                              │                                │
-│                         ┌────▼────┐                           │
-│                         │  Store  │                           │
-│                         └────┬────┘                           │
-└──────────────────────────────┼───────────────────────────────┘
-                               │
-┌──────────────────────────────▼───────────────────────────────┐
-│                      SQLite Database                          │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────┐  │
-│  │ documents  │  │  content   │  │    fts5    │  │embeddings│ │
-│  │  (meta)    │  │  (blobs)   │  │  (search)  │  │(vectors)│  │
-│  └────────────┘  └────────────┘  └────────────┘  └────────┘  │
-└──────────────────────────────────────────────────────────────┘
+Index stored in: `~/.cache/qfs/index.sqlite`
+
+### Schema
+
+```sql
+collections     -- Indexed directories with name and glob patterns
+documents       -- File content with metadata (path, hash, title)
+documents_fts   -- FTS5 full-text index
+embeddings      -- Vector embeddings for semantic search
 ```
 
-### Hybrid Search Pipeline
+## Environment Variables
 
-```
-Query: "async error handling"
-         │
-         ├──────────────────────────────────┐
-         │                                  │
-         ▼                                  ▼
-   ┌──────────┐                      ┌──────────┐
-   │  BM25    │                      │  Vector  │
-   │  Search  │                      │  Search  │
-   └────┬─────┘                      └────┬─────┘
-        │                                 │
-        │  rank 1: doc_a (0.89)           │  rank 1: doc_b (0.92)
-        │  rank 2: doc_b (0.76)           │  rank 2: doc_a (0.88)
-        │  rank 3: doc_c (0.65)           │  rank 3: doc_d (0.71)
-        │                                 │
-        └────────────┬────────────────────┘
-                     │
-                     ▼
-           ┌─────────────────┐
-           │  RRF Fusion     │
-           │  k=60           │
-           └────────┬────────┘
-                    │
-                    ▼
-            Final ranking:
-            1. doc_a (0.033)  ← appears in both
-            2. doc_b (0.032)  ← appears in both
-            3. doc_c (0.016)  ← BM25 only
-            4. doc_d (0.016)  ← vector only
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QFS_DB_PATH` | `~/.cache/qfs/index.sqlite` | Database location |
+| `QFS_LOG_LEVEL` | `info` | Log level (trace, debug, info, warn, error) |
 
-## Library Usage
+## Differences from QMD
 
-```rust
-use qfs::{Store, Indexer, SearchOptions, SearchMode};
-
-// Open database
-let store = Store::open("~/.cache/qfs/index.sqlite")?;
-
-// Add and index a collection
-store.add_collection("notes", "~/notes", &["**/*.md"])?;
-let indexer = Indexer::new(&store);
-indexer.index_collection("notes")?;
-
-// Search
-let searcher = qfs::search::Searcher::new(&store);
-let results = searcher.search("rust async", SearchOptions {
-    mode: SearchMode::Bm25,
-    limit: 20,
-    ..Default::default()
-})?;
-
-for result in results {
-    println!("{}: {:.3}", result.path, result.score);
-}
-```
-
-## Configuration
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `QFS_DB_PATH` | Database location | `~/.cache/qfs/index.sqlite` |
-| `QFS_LOG_LEVEL` | Log level (trace, debug, info, warn, error) | `info` |
-
-## Installation
-
-### From Source
-
-```bash
-git clone https://github.com/juanbermudez/qfs.git
-cd qfs
-cargo build --release
-cp target/release/qfs /usr/local/bin/
-```
-
-### Requirements
-
-- Rust 1.70+
-- SQLite 3.35+ (bundled)
-
-## Development
-
-```bash
-# Run tests
-cargo test
-
-# Run with logging
-RUST_LOG=debug cargo run -- search "test"
-
-# Build release
-cargo build --release
-```
-
-## Roadmap
-
-- [x] Core BM25 search with SQLite FTS5
-- [x] Vector embeddings with fastembed
-- [x] Hybrid search with RRF fusion
-- [x] MCP server for AI agents
-- [ ] Watch mode for live reindexing
-- [ ] Web UI for browsing results
+| Feature | QMD | QFS |
+|---------|-----|-----|
+| **Language** | TypeScript/Bun | Rust |
+| **Runtime** | Node.js + GGUF models | Native binary |
+| **Embeddings** | embeddinggemma (300MB) | fastembed |
+| **LLM Re-ranking** | Yes | No |
+| **Query Expansion** | Yes | No |
+| **Binary Size** | ~3GB (with models) | ~15MB |
+| **Startup Time** | Slower (model loading) | Instant |
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Credits
-
-Inspired by [QMD](https://github.com/tobi/qmd) (Quick Markdown Search).
+MIT
