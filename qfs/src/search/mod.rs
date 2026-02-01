@@ -224,35 +224,45 @@ impl<'a> Searcher<'a> {
     }
 
     /// Vector search with pre-computed query embedding
+    /// Uses libsql's native vector_top_k() for efficient KNN search when available,
+    /// falls back to legacy in-memory cosine similarity calculation otherwise.
     pub async fn search_vector_with_embedding(
         &self,
         query_embedding: &[f32],
         options: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        let embeddings = self
+        // Check if embeddings exist
+        let embed_count = self
             .store
-            .get_all_embeddings_for_search(options.collection.as_deref())
+            .count_embeddings(options.collection.as_deref())
             .await?;
-
-        if embeddings.is_empty() {
+        if embed_count == 0 {
             return Err(Error::EmbeddingsRequired);
         }
 
-        let mut scored: Vec<(f64, crate::store::EmbeddingSearchRow)> = embeddings
-            .into_iter()
-            .map(|row| {
-                let embedding = bytes_to_embedding(&row.embedding);
-                let similarity = cosine_similarity(query_embedding, &embedding);
-                (similarity as f64, row)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Try native vector search first, fall back to legacy if not available
+        let vector_results = match self
+            .store
+            .search_vector_native(query_embedding, options.collection.as_deref(), options.limit)
+            .await?
+        {
+            Some(results) => results,
+            None => {
+                // Fall back to legacy search
+                self.store
+                    .search_vector_legacy(
+                        query_embedding,
+                        options.collection.as_deref(),
+                        options.limit,
+                    )
+                    .await?
+            }
+        };
 
         let mut results = Vec::new();
 
-        for (score, row) in scored.into_iter().take(options.limit) {
-            if score < options.min_score {
+        for row in vector_results {
+            if row.similarity < options.min_score {
                 continue;
             }
 
@@ -277,7 +287,7 @@ impl<'a> Searcher<'a> {
                 mime_type: "text/plain".to_string(),
                 file_size: 0,
                 is_binary: false,
-                score,
+                score: row.similarity,
                 content: None,
                 content_pointer: None,
                 snippet: None,
@@ -426,33 +436,9 @@ pub fn normalize_bm25_score(bm25_score: f64) -> f64 {
     1.0 / (1.0 + bm25_score.abs())
 }
 
-/// Convert bytes to f32 embedding
-fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().unwrap();
-            f32::from_le_bytes(arr)
-        })
-        .collect()
-}
-
-/// Calculate cosine similarity between two embeddings
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot / (norm_a * norm_b)
-}
+// Note: bytes_to_embedding() and cosine_similarity() have been removed.
+// Vector similarity is now calculated natively by libsql using vector_distance_cos()
+// and efficient KNN search via vector_top_k() with the idx_embeddings_vector index.
 
 #[cfg(test)]
 mod tests {
@@ -496,32 +482,8 @@ mod tests {
         assert!("invalid".parse::<SearchMode>().is_err());
     }
 
-    #[test]
-    fn test_cosine_similarity_identical() {
-        let a = vec![1.0, 2.0, 3.0];
-        let sim = cosine_similarity(&a, &a);
-        assert!((sim - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_cosine_similarity_orthogonal() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_bytes_to_embedding() {
-        let embedding = [1.0f32, 2.0, -3.5];
-        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let restored = bytes_to_embedding(&bytes);
-
-        assert_eq!(embedding.len(), restored.len());
-        for (a, b) in embedding.iter().zip(restored.iter()) {
-            assert!((a - b).abs() < 1e-6);
-        }
-    }
+    // Note: cosine_similarity and bytes_to_embedding tests removed.
+    // Vector similarity is now computed natively by libsql's vector_distance_cos().
 
     #[test]
     fn test_reciprocal_rank_fusion() {

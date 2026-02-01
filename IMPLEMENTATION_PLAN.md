@@ -1,4 +1,83 @@
-# QFS Implementation Plan: Port QMD Updates
+# QFS Implementation Plan
+
+## Current Task: `qfs embed` Command
+
+### Status: COMPLETE ✅
+
+### Overview
+
+Add CLI support for generating vector embeddings to enable vector and hybrid search modes.
+
+**Completed on: 2026-02-01**
+
+---
+
+### Stage 6: Add Embed Command to CLI ✅
+
+**Goal**: Add `qfs embed` command that generates embeddings for indexed documents
+
+**Files modified**:
+- `qfs-cli/Cargo.toml` - Added `qfs-embed` dependency
+- `qfs-cli/src/main.rs` - Added Embed command and `cmd_embed` handler
+- `qfs/src/store/mod.rs` - Added `list_all_documents()` method
+
+**Success Criteria**:
+- [x] `qfs embed` generates embeddings for all documents
+- [x] `qfs embed <collection>` generates for specific collection
+- [x] `qfs embed --force` re-generates all embeddings
+- [x] Progress reporting shows documents processed
+- [x] Model download happens automatically on first run
+
+**Status**: Complete ✅
+
+---
+
+### Stage 7: Enable Query Embedding for Search ✅
+
+**Goal**: Make `qfs search --mode vector/hybrid` work by embedding the query
+
+**Files modified**:
+- `qfs-cli/src/main.rs` - Updated `cmd_search` to initialize embedder and embed query for vector/hybrid modes
+
+**Success Criteria**:
+- [x] `qfs search "query" --mode vector` works
+- [x] `qfs search "query" --mode hybrid` works
+- [x] Graceful error if no embeddings exist
+
+**Status**: Complete ✅
+
+---
+
+### Stage 8: Add Embedding Stats to Status Command ✅
+
+**Goal**: Show embedding statistics in `qfs status`
+
+**Files modified**:
+- `qfs-cli/src/main.rs` - Updated `cmd_status` to show embedding stats
+
+**Success Criteria**:
+- [x] Status shows total embeddings count
+- [x] Status shows documents with/without embeddings
+- [x] Per-collection embedding stats
+
+**Status**: Complete ✅
+
+---
+
+### Key Differences from QMD
+
+| Aspect | QMD | QFS |
+|--------|-----|-----|
+| Library | node-llama-cpp (GGUF) | fastembed (ONNX) |
+| Model | embeddinggemma-300M (768d) | all-MiniLM-L6-v2 (384d) |
+| Chunking | Token-based (800 tokens) | Word-based (256 words) |
+| Formatting | `title: X \| text: Y` | Plain text |
+| Vector DB | sqlite-vec virtual table | libsql F32_BLOB(384) + vector_top_k() |
+| Search | Two-step (vec then join) | Native KNN with index |
+
+---
+
+## Completed Tasks (QMD Port)
 
 This plan documents the features from QMD that need to be ported to QFS (the Rust port).
 

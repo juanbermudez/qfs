@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 # Core library
 qfs = { workspace = true }
+qfs-embed = { workspace = true }
 
 # CLI
 clap = { workspace = true }

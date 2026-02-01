@@ -4,7 +4,8 @@ use crate::error::Result;
 use libsql::Connection;
 
 /// Current schema version
-pub const SCHEMA_VERSION: i64 = 2;
+/// v4: Changed embeddings column from BLOB to F32_BLOB(384) for native vector indexing
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// SQL to create the database schema
 const SCHEMA_SQL: &str = r#"
@@ -46,13 +47,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 );
 
 -- Vector embeddings (for optional semantic search)
--- Using libsql native F32_BLOB for vector storage
+-- Using libsql native F32_BLOB(384) for vector storage and indexing
+-- 384 dimensions matches all-MiniLM-L6-v2 (default model)
 CREATE TABLE IF NOT EXISTS embeddings (
     hash TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
     char_offset INTEGER NOT NULL,
     model TEXT NOT NULL,
-    embedding BLOB NOT NULL,
+    embedding F32_BLOB(384),
     created_at TEXT NOT NULL,
     PRIMARY KEY (hash, chunk_index)
 );
@@ -91,6 +93,10 @@ CREATE INDEX IF NOT EXISTS idx_path_contexts_collection ON path_contexts(collect
 -- Note: FTS5 doesn't support traditional triggers, so we sync manually
 -- in the application code using DELETE + INSERT pattern.
 -- This is the recommended approach for FTS5 external content.
+
+-- Note: Vector index for native semantic search (idx_embeddings_vector)
+-- is created lazily when first embedding is inserted to allow libsql
+-- to detect the vector dimensions. See ensure_vector_index().
 "#;
 
 /// Ensure the database schema is up to date
@@ -154,6 +160,7 @@ async fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
 
     // Add migration steps here as schema evolves
     // Version 2: libsql migration (schema compatible, just version bump)
+    // Version 3: Vector index support (created lazily, see ensure_vector_index)
 
     // Update schema version
     conn.execute(
@@ -163,6 +170,97 @@ async fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Ensure the vector index exists for native vector search.
+/// This is called lazily when embeddings are present, since libsql
+/// needs to detect vector dimensions from existing data.
+///
+/// Note: Vector index creation may fail if embeddings were stored as raw BLOB
+/// rather than using libsql's vector32() function. In that case, the legacy
+/// manual cosine similarity search will be used as fallback.
+pub async fn ensure_vector_index(conn: &Connection) -> Result<bool> {
+    // Check if index already exists
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_embeddings_vector'",
+            (),
+        )
+        .await?;
+
+    let exists: bool = if let Some(row) = rows.next().await? {
+        row.get::<i64>(0)? > 0
+    } else {
+        false
+    };
+
+    if exists {
+        return Ok(false); // Index already exists
+    }
+
+    // Check if there are any embeddings to index
+    let mut rows = conn.query("SELECT COUNT(*) FROM embeddings", ()).await?;
+
+    let count: i64 = if let Some(row) = rows.next().await? {
+        row.get(0)?
+    } else {
+        0
+    };
+
+    if count == 0 {
+        return Ok(false); // No embeddings to index
+    }
+
+    // Try to create the vector index
+    // Uses cosine similarity metric (recommended for text embeddings)
+    // This may fail if embeddings were stored as raw BLOB (legacy format)
+    let result = conn
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_embeddings_vector
+                ON embeddings(libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))",
+            (),
+        )
+        .await;
+
+    match result {
+        Ok(_) => {
+            tracing::info!(
+                "Created vector index for native semantic search ({} embeddings)",
+                count
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            // Index creation failed - likely due to legacy BLOB format
+            // This is expected for databases with pre-existing embeddings
+            tracing::debug!(
+                "Vector index creation skipped (embeddings may be in legacy format): {}",
+                e
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Check if the vector index exists and is usable
+pub async fn has_vector_index(conn: &Connection) -> bool {
+    let rows = conn
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_embeddings_vector'",
+            (),
+        )
+        .await;
+
+    match rows {
+        Ok(mut rows) => {
+            if let Ok(Some(row)) = rows.next().await {
+                row.get::<i64>(0).unwrap_or(0) > 0
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

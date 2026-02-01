@@ -30,6 +30,11 @@ cargo install --path qfs-cli          # Install globally as `qfs`
 cargo fmt                             # Format code
 cargo clippy                          # Lint
 
+# Generate embeddings for vector/hybrid search
+qfs embed                             # All collections (downloads model on first run)
+qfs embed notes                       # Specific collection
+qfs embed --force                     # Re-generate all
+
 # Embedding tests (require model download, run separately)
 cargo test -p qfs-embed -- --ignored
 ```
@@ -60,7 +65,7 @@ qfs/                   # Workspace root
 
 - **Searcher** (`qfs/src/search/`): Three search modes:
   - `Bm25`: FTS5 full-text search with score normalization to 0-1 range
-  - `Vector`: Cosine similarity on stored embeddings
+  - `Vector`: Native libsql vector search using `vector_top_k()` with cosine distance
   - `Hybrid`: RRF fusion of BM25 + vector results (k=60)
 
 - **Indexer** (`qfs/src/indexer/`): Incremental indexing via content hashing. Skips unchanged files.
@@ -85,7 +90,10 @@ qfs/                   # Workspace root
 
 - Default path: `~/.cache/qfs/index.sqlite`
 - Override with `QFS_DB_PATH` env var or `--database` flag
-- Schema: `collections`, `documents`, `documents_fts` (FTS5), `content`, `embeddings`
+- Schema version: 4
+- Tables: `collections`, `documents`, `documents_fts` (FTS5), `content`, `embeddings`, `path_contexts`
+- Embeddings use libsql's native F32_BLOB(384) column type for efficient vector indexing
+- Vector index created lazily via `ensure_vector_index()` when embeddings exist
 
 ## Environment Variables
 

@@ -6,6 +6,16 @@
 //! - Collections (indexed directories)
 //! - FTS5 index (full-text search)
 //! - Embeddings (optional vector storage)
+//!
+//! ## Vector Search
+//!
+//! The store supports two vector search modes:
+//! - **Native** (via libsql): Uses `vector_top_k()` with an ANN index for efficient KNN search.
+//!   Requires embeddings to be stored in libsql's vector format.
+//! - **Legacy** (fallback): Loads all embeddings into memory and calculates cosine similarity.
+//!   Works with embeddings stored as raw BLOB data.
+//!
+//! The search automatically falls back to legacy mode if native search is not available.
 
 mod schema;
 
@@ -594,6 +604,37 @@ impl Store {
         Ok(docs)
     }
 
+    /// List all active documents across all collections
+    pub async fn list_all_documents(&self) -> Result<Vec<Document>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
+             FROM documents WHERE active = 1
+             ORDER BY collection, path",
+                (),
+            )
+            .await?;
+
+        let mut docs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            docs.push(Document {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                path: row.get(2)?,
+                title: row.get(3)?,
+                hash: row.get(4)?,
+                file_type: row.get(5)?,
+                created_at: row.get(6)?,
+                modified_at: row.get(7)?,
+                indexed_at: row.get(8)?,
+                active: row.get(9)?,
+            });
+        }
+
+        Ok(docs)
+    }
+
     /// Count documents in a collection
     pub async fn count_documents(&self, collection: Option<&str>) -> Result<i64> {
         let count: i64 = if let Some(coll) = collection {
@@ -1015,6 +1056,7 @@ impl Store {
     // -------------------------------------------------------------------------
 
     /// Insert embeddings for a document chunk
+    /// Column is F32_BLOB(384) which automatically handles the vector format
     pub async fn insert_embedding(
         &self,
         hash: &str,
@@ -1025,6 +1067,7 @@ impl Store {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
 
+        // F32_BLOB column accepts raw bytes (little-endian f32 array)
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO embeddings (hash, chunk_index, char_offset, model, embedding, created_at)
@@ -1123,8 +1166,9 @@ impl Store {
         Ok(count)
     }
 
-    /// Get all embeddings for vector search
+    /// Get all embeddings for vector search (legacy - loads all into memory)
     /// Returns embeddings joined with document info
+    /// DEPRECATED: Use search_vector_native() for efficient native vector search
     pub async fn get_all_embeddings_for_search(
         &self,
         collection: Option<&str>,
@@ -1192,6 +1236,161 @@ impl Store {
         }
 
         Ok(results)
+    }
+
+    /// Ensure the vector index exists for native vector search.
+    /// Returns true if the index was created, false if it already existed or couldn't be created.
+    pub async fn ensure_vector_index(&self) -> Result<bool> {
+        schema::ensure_vector_index(&self.conn).await
+    }
+
+    /// Check if native vector search is available
+    pub async fn has_vector_index(&self) -> bool {
+        schema::has_vector_index(&self.conn).await
+    }
+
+    /// Native vector search using libsql's vector_top_k()
+    /// Uses the idx_embeddings_vector index for efficient KNN search.
+    /// Returns None if native search is not available (falls back to legacy).
+    pub async fn search_vector_native(
+        &self,
+        query_embedding: &[f32],
+        collection: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<Vec<VectorSearchResult>>> {
+        // Try to ensure vector index exists
+        self.ensure_vector_index().await?;
+
+        // Check if index is actually available
+        if !self.has_vector_index().await {
+            return Ok(None); // Fall back to legacy search
+        }
+
+        // Convert f32 embedding to bytes (little-endian)
+        let embedding_bytes: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        // Use vector_top_k for efficient KNN search
+        // The function returns rowids from the index, which we join with embeddings and documents
+        // F32_BLOB column accepts raw bytes directly
+        let query_result = if let Some(coll) = collection {
+            self.conn
+                .query(
+                    r#"
+                SELECT
+                    e.hash,
+                    e.chunk_index,
+                    e.char_offset,
+                    d.id,
+                    d.collection,
+                    d.path,
+                    d.title,
+                    d.file_type,
+                    vector_distance_cos(e.embedding, ?1) as distance
+                FROM vector_top_k('idx_embeddings_vector', ?1, ?2) AS top_k
+                JOIN embeddings e ON e.rowid = top_k.id
+                JOIN documents d ON d.hash = e.hash
+                WHERE d.collection = ?3 AND d.active = 1
+                ORDER BY distance ASC
+                "#,
+                    params![embedding_bytes, limit as i64, coll],
+                )
+                .await
+        } else {
+            self.conn
+                .query(
+                    r#"
+                SELECT
+                    e.hash,
+                    e.chunk_index,
+                    e.char_offset,
+                    d.id,
+                    d.collection,
+                    d.path,
+                    d.title,
+                    d.file_type,
+                    vector_distance_cos(e.embedding, ?1) as distance
+                FROM vector_top_k('idx_embeddings_vector', ?1, ?2) AS top_k
+                JOIN embeddings e ON e.rowid = top_k.id
+                JOIN documents d ON d.hash = e.hash
+                WHERE d.active = 1
+                ORDER BY distance ASC
+                "#,
+                    params![embedding_bytes, limit as i64],
+                )
+                .await
+        };
+
+        // If the query fails (e.g., index not working), return None to trigger fallback
+        let mut rows = match query_result {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!("Native vector search failed, using legacy: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let mut results = Vec::new();
+
+        while let Some(row) = rows.next().await? {
+            let distance: f64 = row.get(8)?;
+            // Convert cosine distance to similarity (1 - distance for cosine)
+            let similarity = 1.0 - distance;
+
+            results.push(VectorSearchResult {
+                hash: row.get(0)?,
+                chunk_index: row.get(1)?,
+                char_offset: row.get(2)?,
+                doc_id: row.get(3)?,
+                collection: row.get(4)?,
+                path: row.get(5)?,
+                title: row.get(6)?,
+                file_type: row.get(7)?,
+                similarity,
+            });
+        }
+
+        Ok(Some(results))
+    }
+
+    /// Legacy vector search - loads all embeddings and calculates similarity in Rust
+    /// Used as fallback when native vector search is not available
+    pub async fn search_vector_legacy(
+        &self,
+        query_embedding: &[f32],
+        collection: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let embeddings = self.get_all_embeddings_for_search(collection).await?;
+
+        let mut scored: Vec<(f64, EmbeddingSearchRow)> = embeddings
+            .into_iter()
+            .map(|row| {
+                let embedding = bytes_to_embedding(&row.embedding);
+                let similarity = cosine_similarity(query_embedding, &embedding);
+                (similarity as f64, row)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(similarity, row)| VectorSearchResult {
+                hash: row.hash,
+                chunk_index: row.chunk_index,
+                char_offset: row.char_offset,
+                doc_id: row.doc_id,
+                collection: row.collection,
+                path: row.path,
+                title: row.title,
+                file_type: row.file_type,
+                similarity,
+            })
+            .collect())
     }
 
     // -------------------------------------------------------------------------
@@ -1375,6 +1574,49 @@ pub struct EmbeddingRow {
     pub model: String,
     pub embedding: Vec<u8>,
     pub created_at: String,
+}
+
+/// Result from native vector search
+#[derive(Debug, Clone)]
+pub struct VectorSearchResult {
+    pub hash: String,
+    pub chunk_index: i32,
+    pub char_offset: i32,
+    pub doc_id: i64,
+    pub collection: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub file_type: String,
+    /// Cosine similarity score (0.0 - 1.0)
+    pub similarity: f64,
+}
+
+/// Convert bytes to f32 embedding (for legacy vector search)
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let arr: [u8; 4] = chunk.try_into().unwrap();
+            f32::from_le_bytes(arr)
+        })
+        .collect()
+}
+
+/// Calculate cosine similarity between two embeddings (for legacy vector search)
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot / (norm_a * norm_b)
 }
 
 /// Row for embedding search (joined with document info)

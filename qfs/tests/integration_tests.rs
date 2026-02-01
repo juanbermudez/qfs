@@ -1116,3 +1116,58 @@ async fn test_get_collections_without_context() {
     assert_eq!(without.len(), 1);
     assert_eq!(without[0].name, "code");
 }
+
+// =============================================================================
+// Vector Index Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_ensure_vector_index_no_embeddings() {
+    let store = Store::open_memory().await.unwrap();
+
+    // Should return false when no embeddings exist
+    let created = store.ensure_vector_index().await.unwrap();
+    assert!(!created, "Should not create index when no embeddings exist");
+}
+
+#[tokio::test]
+async fn test_vector_search_fallback() {
+    let store = Store::open_memory().await.unwrap();
+
+    // Add collection and document
+    store
+        .add_collection("test", "/tmp/test", &["**/*.md"])
+        .await
+        .unwrap();
+    store
+        .insert_content("hash123", b"Test content", "text/plain")
+        .await
+        .unwrap();
+    store
+        .upsert_document("test", "file.md", Some("Title"), "hash123", ".md", "Test")
+        .await
+        .unwrap();
+
+    // Create a mock embedding (384 dimensions as f32 bytes)
+    let embedding: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+    let embedding_bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    // Insert embedding
+    store
+        .insert_embedding("hash123", 0, 0, "test-model", &embedding_bytes)
+        .await
+        .unwrap();
+
+    // Native vector search may not be available (depends on libsql version and data format)
+    // But the legacy fallback should always work
+    let results = store
+        .search_vector_legacy(&embedding, None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1, "Legacy search should find the embedding");
+    assert!(
+        results[0].similarity > 0.99,
+        "Self-similarity should be ~1.0"
+    );
+}

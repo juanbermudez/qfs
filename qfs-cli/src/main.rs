@@ -78,6 +78,28 @@ enum Commands {
         name: Option<String>,
     },
 
+    /// Generate embeddings for documents
+    Embed {
+        /// Collection name (embed all if not specified)
+        name: Option<String>,
+
+        /// Force re-embedding of all documents
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Embedding model (default, minilm, bge)
+        #[arg(long, short = 'm', default_value = "default")]
+        model: String,
+
+        /// Chunk size in words
+        #[arg(long, default_value = "256")]
+        chunk_size: usize,
+
+        /// Chunk overlap in words
+        #[arg(long, default_value = "32")]
+        overlap: usize,
+    },
+
     /// Search for documents
     Search {
         /// Search query
@@ -224,6 +246,13 @@ async fn main() -> Result<()> {
         Commands::List => cmd_list(&db_path).await,
         Commands::Ls { path, format } => cmd_ls(&db_path, path.as_deref(), &format).await,
         Commands::Index { name } => cmd_index(&db_path, name.as_deref()).await,
+        Commands::Embed {
+            name,
+            force,
+            model,
+            chunk_size,
+            overlap,
+        } => cmd_embed(&db_path, name.as_deref(), force, &model, chunk_size, overlap).await,
         Commands::Search {
             query,
             mode,
@@ -496,6 +525,157 @@ async fn cmd_index(db_path: &Path, name: Option<&str>) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn cmd_embed(
+    db_path: &Path,
+    collection: Option<&str>,
+    force: bool,
+    model: &str,
+    chunk_size: usize,
+    overlap: usize,
+) -> Result<()> {
+    use qfs_embed::{chunk_text, embedding_to_bytes, EmbedConfig, Embedder, Model};
+    use std::io::Write;
+
+    let store = Store::open(db_path).await?;
+
+    // Initialize embedder (downloads model if needed)
+    println!("Initializing embedding model...");
+    let model: Model = model.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let config = EmbedConfig {
+        model,
+        show_download_progress: true,
+        ..Default::default()
+    };
+    let embedder = Embedder::with_config(config).map_err(|e| anyhow::anyhow!("{}", e))?;
+    println!(
+        "Using model: {} ({} dimensions)",
+        embedder.model_name(),
+        embedder.dimensions()
+    );
+
+    // Get documents to embed
+    let documents = if let Some(coll) = collection {
+        println!("Embedding collection '{}'...", coll);
+        store.list_documents(coll).await?
+    } else {
+        println!("Embedding all collections...");
+        store.list_all_documents().await?
+    };
+
+    let total = documents.len();
+    if total == 0 {
+        println!("No documents to embed.");
+        return Ok(());
+    }
+
+    let mut embedded = 0;
+    let mut skipped = 0;
+    let mut errors = 0;
+    let mut total_chunks = 0;
+
+    for (i, doc) in documents.iter().enumerate() {
+        // Skip if already has embeddings (unless force)
+        if !force && store.has_embeddings(&doc.hash).await? {
+            skipped += 1;
+            continue;
+        }
+
+        // Delete existing embeddings if force
+        if force {
+            store.delete_embeddings(&doc.hash).await?;
+        }
+
+        // Get document content
+        let content = match store.get_content(&doc.hash).await {
+            Ok(c) => c,
+            Err(e) => {
+                errors += 1;
+                tracing::warn!("Failed to get content for {}: {}", doc.path, e);
+                continue;
+            }
+        };
+
+        let text = match String::from_utf8(content.data) {
+            Ok(t) => t,
+            Err(_) => {
+                skipped += 1; // Binary file
+                continue;
+            }
+        };
+
+        if text.trim().is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Chunk the document
+        let chunks = chunk_text(&text, chunk_size, overlap);
+        if chunks.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Generate embeddings
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let embeddings = match embedder.embed(&texts) {
+            Ok(e) => e,
+            Err(e) => {
+                errors += 1;
+                tracing::warn!("Failed to embed {}: {}", doc.path, e);
+                continue;
+            }
+        };
+
+        // Store embeddings
+        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+            let bytes = embedding_to_bytes(embedding);
+            store
+                .insert_embedding(
+                    &doc.hash,
+                    chunk.index as i32,
+                    chunk.char_offset as i32,
+                    embedder.model_name(),
+                    &bytes,
+                )
+                .await?;
+        }
+
+        embedded += 1;
+        total_chunks += chunks.len();
+
+        // Progress update
+        print!(
+            "\rProgress: {}/{} documents ({} embedded, {} skipped)",
+            i + 1,
+            total,
+            embedded,
+            skipped
+        );
+        std::io::stdout().flush().ok();
+    }
+    println!();
+
+    // Ensure vector index exists for efficient search
+    if embedded > 0 {
+        print!("Creating vector index...");
+        std::io::stdout().flush().ok();
+        match store.ensure_vector_index().await {
+            Ok(true) => println!(" done"),
+            Ok(false) => println!(" skipped (already exists or no embeddings)"),
+            Err(e) => println!(" warning: {}", e),
+        }
+    }
+
+    println!("\nEmbedding complete:");
+    println!("  Documents embedded: {}", embedded);
+    println!("  Documents skipped: {}", skipped);
+    println!("  Total chunks: {}", total_chunks);
+    println!("  Errors: {}", errors);
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cmd_search(
     db_path: &Path,
     query: &str,
@@ -510,7 +690,7 @@ async fn cmd_search(
 
     let search_mode: SearchMode = mode.parse()?;
     let options = SearchOptions {
-        mode: search_mode,
+        mode: search_mode.clone(),
         limit,
         min_score,
         collection: collection.map(String::from),
@@ -518,7 +698,51 @@ async fn cmd_search(
     };
 
     let searcher = qfs::search::Searcher::new(&store);
-    let results = searcher.search(query, options).await?;
+
+    // For vector/hybrid modes, we need to embed the query first
+    let results = match search_mode {
+        SearchMode::Bm25 => searcher.search(query, options).await?,
+        SearchMode::Vector => {
+            // Check if embeddings exist
+            let embed_count = store.count_embeddings(collection).await?;
+            if embed_count == 0 {
+                anyhow::bail!(
+                    "No embeddings found. Run 'qfs embed' first to enable vector search."
+                );
+            }
+
+            // Initialize embedder and embed query
+            let embedder =
+                qfs_embed::Embedder::new().map_err(|e| anyhow::anyhow!("Embedder error: {}", e))?;
+            let query_embedding = embedder
+                .embed_one(query)
+                .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+
+            searcher
+                .search_vector_with_embedding(&query_embedding, &options)
+                .await?
+        }
+        SearchMode::Hybrid => {
+            // Check if embeddings exist
+            let embed_count = store.count_embeddings(collection).await?;
+            if embed_count == 0 {
+                anyhow::bail!(
+                    "No embeddings found. Run 'qfs embed' first to enable hybrid search."
+                );
+            }
+
+            // Initialize embedder and embed query
+            let embedder =
+                qfs_embed::Embedder::new().map_err(|e| anyhow::anyhow!("Embedder error: {}", e))?;
+            let query_embedding = embedder
+                .embed_one(query)
+                .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+
+            searcher
+                .search_hybrid_with_embedding(query, &query_embedding, &options)
+                .await?
+        }
+    };
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&results)?);
@@ -650,20 +874,44 @@ async fn cmd_status(db_path: &Path) -> Result<()> {
     let store = Store::open(db_path).await?;
     let collections = store.list_collections().await?;
     let total_docs = store.count_documents(None).await?;
+    let docs_with_embeddings = store.count_embeddings(None).await?;
 
     println!("QFS Status");
     println!("===========");
     println!("Database: {}", db_path.display());
     println!("Collections: {}", collections.len());
     println!("Total documents: {}", total_docs);
+    println!(
+        "Documents with embeddings: {}/{}",
+        docs_with_embeddings, total_docs
+    );
+
+    if docs_with_embeddings < total_docs && total_docs > 0 {
+        println!("  (run 'qfs embed' to generate missing embeddings)");
+    }
 
     if !collections.is_empty() {
         println!("\nPer-collection stats:");
-        for col in collections {
+        for col in &collections {
             let count = store.count_documents(Some(&col.name)).await.unwrap_or(0);
-            println!("  {}: {} documents", col.name, count);
+            let embedded = store.count_embeddings(Some(&col.name)).await.unwrap_or(0);
+            println!(
+                "  {}: {} documents ({} embedded)",
+                col.name, count, embedded
+            );
         }
     }
+
+    // Check vector index status
+    let has_index = store.has_vector_index().await;
+    println!(
+        "\nVector search: {}",
+        if has_index {
+            "ready"
+        } else {
+            "not indexed"
+        }
+    );
 
     Ok(())
 }
