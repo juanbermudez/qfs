@@ -944,12 +944,15 @@ impl Store {
     // -------------------------------------------------------------------------
 
     /// Execute BM25 full-text search
+    /// Supports optional filtering by collection and date range (modified_at)
     pub async fn search_bm25(
         &self,
         fts_query: &str,
         collection: Option<&str>,
         limit: usize,
         include_binary: bool,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
     ) -> Result<Vec<SearchResultRow>> {
         let mut results = Vec::new();
 
@@ -957,60 +960,64 @@ impl Store {
             return Ok(results);
         }
 
-        let mut rows = if let Some(coll) = collection {
-            self.conn
-                .query(
-                    r#"
-                SELECT
-                    d.id,
-                    d.collection,
-                    d.path,
-                    d.title,
-                    d.hash,
-                    d.file_type,
-                    c.content_type,
-                    c.size,
-                    bm25(documents_fts) as bm25_score,
-                    snippet(documents_fts, 2, '<mark>', '</mark>', '...', 64) as snippet
-                FROM documents_fts
-                JOIN documents d ON d.id = documents_fts.rowid
-                JOIN content c ON c.hash = d.hash
-                WHERE documents_fts MATCH ?1
-                  AND d.collection = ?2
-                  AND d.active = 1
-                ORDER BY bm25_score
-                LIMIT ?3
-                "#,
-                    params![fts_query, coll, limit as i64],
-                )
-                .await?
-        } else {
-            self.conn
-                .query(
-                    r#"
-                SELECT
-                    d.id,
-                    d.collection,
-                    d.path,
-                    d.title,
-                    d.hash,
-                    d.file_type,
-                    c.content_type,
-                    c.size,
-                    bm25(documents_fts) as bm25_score,
-                    snippet(documents_fts, 2, '<mark>', '</mark>', '...', 64) as snippet
-                FROM documents_fts
-                JOIN documents d ON d.id = documents_fts.rowid
-                JOIN content c ON c.hash = d.hash
-                WHERE documents_fts MATCH ?1
-                  AND d.active = 1
-                ORDER BY bm25_score
-                LIMIT ?2
-                "#,
-                    params![fts_query, limit as i64],
-                )
-                .await?
-        };
+        // Build query dynamically based on filters
+        let mut where_clauses: Vec<String> = vec![
+            "documents_fts MATCH ?1".to_string(),
+            "d.active = 1".to_string(),
+        ];
+        let mut param_idx = 2;
+
+        if collection.is_some() {
+            where_clauses.push(format!("d.collection = ?{}", param_idx));
+            param_idx += 1;
+        }
+        if from_date.is_some() {
+            where_clauses.push(format!("d.modified_at >= ?{}", param_idx));
+            param_idx += 1;
+        }
+        if to_date.is_some() {
+            where_clauses.push(format!("d.modified_at <= ?{}", param_idx));
+            param_idx += 1;
+        }
+
+        let query = format!(
+            r#"
+            SELECT
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.hash,
+                d.file_type,
+                c.content_type,
+                c.size,
+                bm25(documents_fts) as bm25_score,
+                snippet(documents_fts, 2, '<mark>', '</mark>', '...', 64) as snippet
+            FROM documents_fts
+            JOIN documents d ON d.id = documents_fts.rowid
+            JOIN content c ON c.hash = d.hash
+            WHERE {}
+            ORDER BY bm25_score
+            LIMIT ?{}
+            "#,
+            where_clauses.join(" AND "),
+            param_idx
+        );
+
+        // Build params dynamically
+        let mut params: Vec<libsql::Value> = vec![fts_query.into()];
+        if let Some(coll) = collection {
+            params.push(coll.into());
+        }
+        if let Some(from) = from_date {
+            params.push(from.into());
+        }
+        if let Some(to) = to_date {
+            params.push(to.into());
+        }
+        params.push((limit as i64).into());
+
+        let mut rows = self.conn.query(&query, params).await?;
 
         while let Some(row) = rows.next().await? {
             let content_type: String = row.get(6)?;
@@ -1172,54 +1179,60 @@ impl Store {
     pub async fn get_all_embeddings_for_search(
         &self,
         collection: Option<&str>,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
     ) -> Result<Vec<EmbeddingSearchRow>> {
         let mut results = Vec::new();
 
-        let mut rows = if let Some(coll) = collection {
-            self.conn
-                .query(
-                    r#"
-                SELECT
-                    e.hash,
-                    e.chunk_index,
-                    e.char_offset,
-                    e.embedding,
-                    d.id,
-                    d.collection,
-                    d.path,
-                    d.title,
-                    d.file_type
-                FROM embeddings e
-                JOIN documents d ON d.hash = e.hash
-                WHERE d.collection = ?1 AND d.active = 1
-                ORDER BY d.id, e.chunk_index
-                "#,
-                    params![coll],
-                )
-                .await?
-        } else {
-            self.conn
-                .query(
-                    r#"
-                SELECT
-                    e.hash,
-                    e.chunk_index,
-                    e.char_offset,
-                    e.embedding,
-                    d.id,
-                    d.collection,
-                    d.path,
-                    d.title,
-                    d.file_type
-                FROM embeddings e
-                JOIN documents d ON d.hash = e.hash
-                WHERE d.active = 1
-                ORDER BY d.id, e.chunk_index
-                "#,
-                    (),
-                )
-                .await?
-        };
+        // Build query dynamically based on filters
+        let mut where_clauses: Vec<String> = vec!["d.active = 1".to_string()];
+        let mut param_idx = 1;
+
+        if collection.is_some() {
+            where_clauses.push(format!("d.collection = ?{}", param_idx));
+            param_idx += 1;
+        }
+        if from_date.is_some() {
+            where_clauses.push(format!("d.modified_at >= ?{}", param_idx));
+            param_idx += 1;
+        }
+        if to_date.is_some() {
+            where_clauses.push(format!("d.modified_at <= ?{}", param_idx));
+        }
+
+        let query = format!(
+            r#"
+            SELECT
+                e.hash,
+                e.chunk_index,
+                e.char_offset,
+                e.embedding,
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.file_type
+            FROM embeddings e
+            JOIN documents d ON d.hash = e.hash
+            WHERE {}
+            ORDER BY d.id, e.chunk_index
+            "#,
+            where_clauses.join(" AND ")
+        );
+
+        // Build params dynamically
+        let mut params: Vec<libsql::Value> = vec![];
+        if let Some(coll) = collection {
+            params.push(coll.into());
+        }
+        if let Some(from) = from_date {
+            params.push(from.into());
+        }
+        if let Some(to) = to_date {
+            params.push(to.into());
+        }
+
+        let mut rows = self.conn.query(&query, params).await?;
 
         while let Some(row) = rows.next().await? {
             results.push(EmbeddingSearchRow {
@@ -1251,12 +1264,15 @@ impl Store {
 
     /// Native vector search using libsql's vector_top_k()
     /// Uses the idx_embeddings_vector index for efficient KNN search.
+    /// Supports optional filtering by collection and date range (modified_at).
     /// Returns None if native search is not available (falls back to legacy).
     pub async fn search_vector_native(
         &self,
         query_embedding: &[f32],
         collection: Option<&str>,
         limit: usize,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
     ) -> Result<Option<Vec<VectorSearchResult>>> {
         // Try to ensure vector index exists
         self.ensure_vector_index().await?;
@@ -1272,56 +1288,60 @@ impl Store {
             .flat_map(|f| f.to_le_bytes())
             .collect();
 
-        // Use vector_top_k for efficient KNN search
-        // The function returns rowids from the index, which we join with embeddings and documents
-        // F32_BLOB column accepts raw bytes directly
-        let query_result = if let Some(coll) = collection {
-            self.conn
-                .query(
-                    r#"
-                SELECT
-                    e.hash,
-                    e.chunk_index,
-                    e.char_offset,
-                    d.id,
-                    d.collection,
-                    d.path,
-                    d.title,
-                    d.file_type,
-                    vector_distance_cos(e.embedding, ?1) as distance
-                FROM vector_top_k('idx_embeddings_vector', ?1, ?2) AS top_k
-                JOIN embeddings e ON e.rowid = top_k.id
-                JOIN documents d ON d.hash = e.hash
-                WHERE d.collection = ?3 AND d.active = 1
-                ORDER BY distance ASC
-                "#,
-                    params![embedding_bytes, limit as i64, coll],
-                )
-                .await
-        } else {
-            self.conn
-                .query(
-                    r#"
-                SELECT
-                    e.hash,
-                    e.chunk_index,
-                    e.char_offset,
-                    d.id,
-                    d.collection,
-                    d.path,
-                    d.title,
-                    d.file_type,
-                    vector_distance_cos(e.embedding, ?1) as distance
-                FROM vector_top_k('idx_embeddings_vector', ?1, ?2) AS top_k
-                JOIN embeddings e ON e.rowid = top_k.id
-                JOIN documents d ON d.hash = e.hash
-                WHERE d.active = 1
-                ORDER BY distance ASC
-                "#,
-                    params![embedding_bytes, limit as i64],
-                )
-                .await
-        };
+        // Build WHERE clause dynamically
+        // Note: ?1 = embedding bytes, ?2 = limit
+        let mut where_clauses: Vec<String> = vec!["d.active = 1".to_string()];
+        let mut param_idx = 3;
+
+        if collection.is_some() {
+            where_clauses.push(format!("d.collection = ?{}", param_idx));
+            param_idx += 1;
+        }
+        if from_date.is_some() {
+            where_clauses.push(format!("d.modified_at >= ?{}", param_idx));
+            param_idx += 1;
+        }
+        if to_date.is_some() {
+            where_clauses.push(format!("d.modified_at <= ?{}", param_idx));
+        }
+
+        let query = format!(
+            r#"
+            SELECT
+                e.hash,
+                e.chunk_index,
+                e.char_offset,
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.file_type,
+                vector_distance_cos(e.embedding, ?1) as distance
+            FROM vector_top_k('idx_embeddings_vector', ?1, ?2) AS top_k
+            JOIN embeddings e ON e.rowid = top_k.id
+            JOIN documents d ON d.hash = e.hash
+            WHERE {}
+            ORDER BY distance ASC
+            "#,
+            where_clauses.join(" AND ")
+        );
+
+        // Build params dynamically
+        let mut params: Vec<libsql::Value> = vec![
+            embedding_bytes.into(),
+            (limit as i64).into(),
+        ];
+        if let Some(coll) = collection {
+            params.push(coll.into());
+        }
+        if let Some(from) = from_date {
+            params.push(from.into());
+        }
+        if let Some(to) = to_date {
+            params.push(to.into());
+        }
+
+        let query_result = self.conn.query(&query, params).await;
 
         // If the query fails (e.g., index not working), return None to trigger fallback
         let mut rows = match query_result {
@@ -1357,13 +1377,18 @@ impl Store {
 
     /// Legacy vector search - loads all embeddings and calculates similarity in Rust
     /// Used as fallback when native vector search is not available
+    /// Supports optional date filtering (modified_at)
     pub async fn search_vector_legacy(
         &self,
         query_embedding: &[f32],
         collection: Option<&str>,
         limit: usize,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
     ) -> Result<Vec<VectorSearchResult>> {
-        let embeddings = self.get_all_embeddings_for_search(collection).await?;
+        let embeddings = self
+            .get_all_embeddings_for_search(collection, from_date, to_date)
+            .await?;
 
         let mut scored: Vec<(f64, EmbeddingSearchRow)> = embeddings
             .into_iter()
@@ -1806,7 +1831,7 @@ mod tests {
 
         // Search for "rust"
         let results = store
-            .search_bm25("\"rust\"*", None, 10, false)
+            .search_bm25("\"rust\"*", None, 10, false, None, None)
             .await
             .unwrap();
         assert!(!results.is_empty(), "Should find results for 'rust'");
@@ -1814,27 +1839,27 @@ mod tests {
 
         // Search for "programming"
         let results = store
-            .search_bm25("\"programming\"*", None, 10, false)
+            .search_bm25("\"programming\"*", None, 10, false, None, None)
             .await
             .unwrap();
         assert!(!results.is_empty(), "Should find results for 'programming'");
 
         // Search for "language"
         let results = store
-            .search_bm25("\"language\"*", None, 10, false)
+            .search_bm25("\"language\"*", None, 10, false, None, None)
             .await
             .unwrap();
         assert_eq!(results.len(), 2, "Should find 2 results for 'language'");
 
         // Search with collection filter
         let results = store
-            .search_bm25("\"rust\"*", Some("test"), 10, false)
+            .search_bm25("\"rust\"*", Some("test"), 10, false, None, None)
             .await
             .unwrap();
         assert!(!results.is_empty());
 
         let results = store
-            .search_bm25("\"rust\"*", Some("nonexistent"), 10, false)
+            .search_bm25("\"rust\"*", Some("nonexistent"), 10, false, None, None)
             .await
             .unwrap();
         assert!(results.is_empty());

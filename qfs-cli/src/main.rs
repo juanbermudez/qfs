@@ -121,6 +121,14 @@ enum Commands {
         #[arg(long, short = 'c')]
         collection: Option<String>,
 
+        /// Filter documents modified on or after this date (ISO 8601, e.g., 2025-01-01)
+        #[arg(long)]
+        from_date: Option<String>,
+
+        /// Filter documents modified on or before this date (ISO 8601, e.g., 2025-12-31)
+        #[arg(long)]
+        to_date: Option<String>,
+
         /// Include binary files in results
         #[arg(long)]
         include_binary: bool,
@@ -259,6 +267,8 @@ async fn main() -> Result<()> {
             limit,
             min_score,
             collection,
+            from_date,
+            to_date,
             include_binary,
             format,
         } => {
@@ -269,6 +279,8 @@ async fn main() -> Result<()> {
                 limit,
                 min_score,
                 collection.as_deref(),
+                from_date.as_deref(),
+                to_date.as_deref(),
                 include_binary,
                 &format,
             )
@@ -683,6 +695,8 @@ async fn cmd_search(
     limit: usize,
     min_score: f64,
     collection: Option<&str>,
+    from_date: Option<&str>,
+    to_date: Option<&str>,
     include_binary: bool,
     format: &str,
 ) -> Result<()> {
@@ -695,6 +709,8 @@ async fn cmd_search(
         min_score,
         collection: collection.map(String::from),
         include_binary,
+        from_date: from_date.map(String::from),
+        to_date: to_date.map(String::from),
     };
 
     let searcher = qfs::search::Searcher::new(&store);

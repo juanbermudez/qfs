@@ -12,7 +12,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "qfs_search".to_string(),
-            description: "Full-text search across indexed documents using BM25 ranking. Returns relevant documents with snippets.".to_string(),
+            description: "Full-text search across indexed documents using BM25 ranking. Returns relevant documents with snippets. Supports date filtering.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -28,6 +28,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum number of results (default: 20)",
                         "default": 20
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or after this date (ISO 8601, e.g., '2025-01-01')"
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or before this date (ISO 8601, e.g., '2025-12-31')"
                     }
                 },
                 "required": ["query"]
@@ -35,7 +43,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "qfs_vsearch".to_string(),
-            description: "Semantic vector search using embeddings. Requires embeddings to be generated first.".to_string(),
+            description: "Semantic vector search using embeddings. Requires embeddings to be generated first. Supports date filtering.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -51,6 +59,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum number of results (default: 20)",
                         "default": 20
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or after this date (ISO 8601, e.g., '2025-01-01')"
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or before this date (ISO 8601, e.g., '2025-12-31')"
                     }
                 },
                 "required": ["query"]
@@ -58,7 +74,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "qfs_query".to_string(),
-            description: "Hybrid search combining BM25 and vector search with Reciprocal Rank Fusion. Requires mode parameter to select search type.".to_string(),
+            description: "Hybrid search combining BM25 and vector search with Reciprocal Rank Fusion. Supports date filtering.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -80,6 +96,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum number of results (default: 20)",
                         "default": 20
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or after this date (ISO 8601, e.g., '2025-01-01')"
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or before this date (ISO 8601, e.g., '2025-12-31')"
                     }
                 },
                 "required": ["query"]
@@ -185,6 +209,8 @@ async fn tool_search(
 
     let collection = args.get("collection").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let from_date = args.get("from_date").and_then(|v| v.as_str());
+    let to_date = args.get("to_date").and_then(|v| v.as_str());
 
     let options = SearchOptions {
         mode,
@@ -192,6 +218,8 @@ async fn tool_search(
         min_score: 0.0,
         collection: collection.map(String::from),
         include_binary: false,
+        from_date: from_date.map(String::from),
+        to_date: to_date.map(String::from),
     };
 
     let searcher = Searcher::new(store);
@@ -221,6 +249,8 @@ async fn tool_query(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcEr
 
     let collection = args.get("collection").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let from_date = args.get("from_date").and_then(|v| v.as_str());
+    let to_date = args.get("to_date").and_then(|v| v.as_str());
 
     let options = SearchOptions {
         mode,
@@ -228,6 +258,8 @@ async fn tool_query(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcEr
         min_score: 0.0,
         collection: collection.map(String::from),
         include_binary: false,
+        from_date: from_date.map(String::from),
+        to_date: to_date.map(String::from),
     };
 
     let searcher = Searcher::new(store);

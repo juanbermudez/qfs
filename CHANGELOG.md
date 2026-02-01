@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Query embedding at runtime for `--mode vector` and `--mode hybrid`
 - Embedding statistics in `qfs status` output
 - Vector index creation via `libsql_vector_idx()` for O(log n) KNN search
+- Date filtering for all search modes via `--from-date` and `--to-date` flags (ISO 8601)
+- MCP tools support date filtering via `from_date` and `to_date` parameters
 
 ### Changed
 - Migrated from rusqlite to libsql for async database operations

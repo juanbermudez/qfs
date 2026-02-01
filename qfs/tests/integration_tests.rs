@@ -1161,7 +1161,7 @@ async fn test_vector_search_fallback() {
     // Native vector search may not be available (depends on libsql version and data format)
     // But the legacy fallback should always work
     let results = store
-        .search_vector_legacy(&embedding, None, 10)
+        .search_vector_legacy(&embedding, None, 10, None, None)
         .await
         .unwrap();
 
@@ -1169,5 +1169,47 @@ async fn test_vector_search_fallback() {
     assert!(
         results[0].similarity > 0.99,
         "Self-similarity should be ~1.0"
+    );
+}
+
+#[tokio::test]
+async fn test_search_with_date_filter() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
+
+    // Search without date filter should return results
+    let results = store
+        .search_bm25("rust", None, 10, false, None, None)
+        .await
+        .unwrap();
+    assert!(!results.is_empty(), "Should find results without date filter");
+
+    // Search with future from_date should return no results (documents were created "now")
+    let results = store
+        .search_bm25("rust", None, 10, false, Some("2099-01-01"), None)
+        .await
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "Should not find results with future from_date"
+    );
+
+    // Search with past to_date should return no results
+    let results = store
+        .search_bm25("rust", None, 10, false, None, Some("2000-01-01"))
+        .await
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "Should not find results with past to_date"
+    );
+
+    // Search with valid date range covering "now" should return results
+    let results = store
+        .search_bm25("rust", None, 10, false, Some("2020-01-01"), Some("2099-12-31"))
+        .await
+        .unwrap();
+    assert!(
+        !results.is_empty(),
+        "Should find results within valid date range"
     );
 }

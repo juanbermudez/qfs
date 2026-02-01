@@ -67,6 +67,7 @@ qfs/                   # Workspace root
   - `Bm25`: FTS5 full-text search with score normalization to 0-1 range
   - `Vector`: Native libsql vector search using `vector_top_k()` with cosine distance
   - `Hybrid`: RRF fusion of BM25 + vector results (k=60)
+  - All modes support optional date filtering via `from_date` and `to_date` (ISO 8601)
 
 - **Indexer** (`qfs/src/indexer/`): Incremental indexing via content hashing. Skips unchanged files.
 

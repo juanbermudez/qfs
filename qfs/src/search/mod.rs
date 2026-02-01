@@ -44,6 +44,10 @@ pub struct SearchOptions {
     pub collection: Option<String>,
     /// Include binary files in results
     pub include_binary: bool,
+    /// Filter documents modified on or after this date (ISO 8601 format)
+    pub from_date: Option<String>,
+    /// Filter documents modified on or before this date (ISO 8601 format)
+    pub to_date: Option<String>,
 }
 
 impl Default for SearchOptions {
@@ -54,6 +58,8 @@ impl Default for SearchOptions {
             min_score: 0.0,
             collection: None,
             include_binary: false,
+            from_date: None,
+            to_date: None,
         }
     }
 }
@@ -143,6 +149,8 @@ impl<'a> Searcher<'a> {
                 options.collection.as_deref(),
                 options.limit,
                 options.include_binary,
+                options.from_date.as_deref(),
+                options.to_date.as_deref(),
             )
             .await?;
 
@@ -241,9 +249,22 @@ impl<'a> Searcher<'a> {
         }
 
         // Try native vector search first, fall back to legacy if not available
+        // Over-fetch by 3x when date filtering to compensate for post-filtering
+        let fetch_limit = if options.from_date.is_some() || options.to_date.is_some() {
+            options.limit * 3
+        } else {
+            options.limit
+        };
+
         let vector_results = match self
             .store
-            .search_vector_native(query_embedding, options.collection.as_deref(), options.limit)
+            .search_vector_native(
+                query_embedding,
+                options.collection.as_deref(),
+                fetch_limit,
+                options.from_date.as_deref(),
+                options.to_date.as_deref(),
+            )
             .await?
         {
             Some(results) => results,
@@ -253,7 +274,9 @@ impl<'a> Searcher<'a> {
                     .search_vector_legacy(
                         query_embedding,
                         options.collection.as_deref(),
-                        options.limit,
+                        fetch_limit,
+                        options.from_date.as_deref(),
+                        options.to_date.as_deref(),
                     )
                     .await?
             }
@@ -264,6 +287,11 @@ impl<'a> Searcher<'a> {
         for row in vector_results {
             if row.similarity < options.min_score {
                 continue;
+            }
+
+            // Stop if we've reached the requested limit
+            if results.len() >= options.limit {
+                break;
             }
 
             let name = std::path::Path::new(&row.path)

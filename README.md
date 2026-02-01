@@ -310,6 +310,12 @@ qfs search "how to login" --mode vector
 
 # Hybrid search (best quality)
 qfs search "user authentication" --mode hybrid
+
+# Search within a date range
+qfs search "meeting notes" --from-date 2025-01-01 --to-date 2025-01-31
+
+# Search documents modified after a date
+qfs search "project updates" --from-date 2025-06-01
 ```
 
 ### Get and Multi-Get
@@ -353,6 +359,8 @@ qfs multi-get "docs/*.md" --format json
 -n, --limit <num>        # Number of results (default: 20)
 -m, --mode <mode>        # bm25, vector, hybrid (default: bm25)
 -c, --collection <name>  # Restrict to a collection
+--from-date <date>       # Filter by modified date (ISO 8601, e.g., 2025-01-01)
+--to-date <date>         # Filter by modified date (ISO 8601, e.g., 2025-12-31)
 --min-score <num>        # Minimum score threshold (default: 0.0)
 --include-binary         # Include binary files in results
 -o, --format <format>    # text, json (default: text)
