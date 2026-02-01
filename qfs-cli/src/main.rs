@@ -188,7 +188,8 @@ enum ContextAction {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -212,17 +213,17 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Init => cmd_init(&db_path),
+        Commands::Init => cmd_init(&db_path).await,
         Commands::Add {
             name,
             path,
             patterns,
             exclude,
-        } => cmd_add(&db_path, &name, &path, &patterns, &exclude),
-        Commands::Remove { name } => cmd_remove(&db_path, &name),
-        Commands::List => cmd_list(&db_path),
-        Commands::Ls { path, format } => cmd_ls(&db_path, path.as_deref(), &format),
-        Commands::Index { name } => cmd_index(&db_path, name.as_deref()),
+        } => cmd_add(&db_path, &name, &path, &patterns, &exclude).await,
+        Commands::Remove { name } => cmd_remove(&db_path, &name).await,
+        Commands::List => cmd_list(&db_path).await,
+        Commands::Ls { path, format } => cmd_ls(&db_path, path.as_deref(), &format).await,
+        Commands::Index { name } => cmd_index(&db_path, name.as_deref()).await,
         Commands::Search {
             query,
             mode,
@@ -231,50 +232,53 @@ fn main() -> Result<()> {
             collection,
             include_binary,
             format,
-        } => cmd_search(
-            &db_path,
-            &query,
-            &mode,
-            limit,
-            min_score,
-            collection.as_deref(),
-            include_binary,
-            &format,
-        ),
+        } => {
+            cmd_search(
+                &db_path,
+                &query,
+                &mode,
+                limit,
+                min_score,
+                collection.as_deref(),
+                include_binary,
+                &format,
+            )
+            .await
+        }
         Commands::Get {
             path,
             from,
             max_lines,
             line_numbers,
             format,
-        } => cmd_get(&db_path, &path, from, max_lines, line_numbers, &format),
+        } => cmd_get(&db_path, &path, from, max_lines, line_numbers, &format).await,
         Commands::MultiGet {
             pattern,
             max_bytes,
             max_lines,
             format,
-        } => cmd_multi_get(&db_path, &pattern, max_bytes, max_lines, &format),
-        Commands::Status => cmd_status(&db_path),
-        Commands::Serve => cmd_serve(&db_path),
-        Commands::Context { action } => cmd_context(&db_path, action),
+        } => cmd_multi_get(&db_path, &pattern, max_bytes, max_lines, &format).await,
+        Commands::Status => cmd_status(&db_path).await,
+        Commands::Serve => cmd_serve(&db_path).await,
+        Commands::Context { action } => cmd_context(&db_path, action).await,
     }
 }
 
-fn cmd_init(db_path: &Path) -> Result<()> {
+async fn cmd_init(db_path: &Path) -> Result<()> {
     println!("Initializing QFS database at: {}", db_path.display());
-    let _store = Store::open(db_path)?;
+    let _store = Store::open(db_path).await?;
     println!("Database initialized successfully.");
     Ok(())
 }
 
-fn cmd_add(
+async fn cmd_add(
     db_path: &Path,
     name: &str,
     path: &Path,
     patterns: &[String],
     exclude: &[String],
 ) -> Result<()> {
-    let store = Store::open(db_path)?;
+    let store = Store::open(db_path).await?;
 
     let pattern_refs: Vec<&str> = if patterns.is_empty() {
         vec!["**/*"]
@@ -283,7 +287,7 @@ fn cmd_add(
     };
 
     let path_str = path.to_string_lossy();
-    store.add_collection(name, &path_str, &pattern_refs)?;
+    store.add_collection(name, &path_str, &pattern_refs).await?;
 
     // Store exclude patterns (would need schema update)
     let _ = exclude; // TODO: implement exclude patterns in schema
@@ -292,16 +296,16 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_remove(db_path: &Path, name: &str) -> Result<()> {
-    let store = Store::open(db_path)?;
-    store.remove_collection(name)?;
+async fn cmd_remove(db_path: &Path, name: &str) -> Result<()> {
+    let store = Store::open(db_path).await?;
+    store.remove_collection(name).await?;
     println!("Removed collection '{}'", name);
     Ok(())
 }
 
-fn cmd_list(db_path: &Path) -> Result<()> {
-    let store = Store::open(db_path)?;
-    let collections = store.list_collections()?;
+async fn cmd_list(db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path).await?;
+    let collections = store.list_collections().await?;
 
     if collections.is_empty() {
         println!("No collections found. Use 'qfs add' to add a collection.");
@@ -310,7 +314,7 @@ fn cmd_list(db_path: &Path) -> Result<()> {
 
     println!("Collections:");
     for col in collections {
-        let doc_count = store.count_documents(Some(&col.name)).unwrap_or(0);
+        let doc_count = store.count_documents(Some(&col.name)).await.unwrap_or(0);
         println!(
             "  {} ({} documents)\n    Path: {}",
             col.name, doc_count, col.path
@@ -381,13 +385,13 @@ fn parse_ls_path(path: &str) -> (String, Option<String>) {
     }
 }
 
-fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
-    let store = Store::open(db_path)?;
+async fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
+    let store = Store::open(db_path).await?;
 
     match path {
         None => {
             // List all collections
-            let collections = store.list_collections()?;
+            let collections = store.list_collections().await?;
 
             if collections.is_empty() {
                 println!("No collections found. Use 'qfs add' to add a collection.");
@@ -395,22 +399,20 @@ fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
             }
 
             if format == "json" {
-                let data: Vec<_> = collections
-                    .iter()
-                    .map(|c| {
-                        let count = store.count_documents(Some(&c.name)).unwrap_or(0);
-                        serde_json::json!({
-                            "name": c.name,
-                            "path": c.path,
-                            "documents": count,
-                        })
-                    })
-                    .collect();
+                let mut data = Vec::new();
+                for c in &collections {
+                    let count = store.count_documents(Some(&c.name)).await.unwrap_or(0);
+                    data.push(serde_json::json!({
+                        "name": c.name,
+                        "path": c.path,
+                        "documents": count,
+                    }));
+                }
                 println!("{}", serde_json::to_string_pretty(&data)?);
             } else {
                 println!("Collections:\n");
                 for col in collections {
-                    let doc_count = store.count_documents(Some(&col.name)).unwrap_or(0);
+                    let doc_count = store.count_documents(Some(&col.name)).await.unwrap_or(0);
                     println!("  qfs://{}/  ({} files)", col.name, doc_count);
                 }
             }
@@ -420,14 +422,16 @@ fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
             let (collection_name, path_prefix) = parse_ls_path(path_arg);
 
             // Verify collection exists
-            if store.get_collection(&collection_name).is_err() {
+            if store.get_collection(&collection_name).await.is_err() {
                 anyhow::bail!(
                     "Collection not found: {}\nRun 'qfs ls' to see available collections.",
                     collection_name
                 );
             }
 
-            let files = store.list_files(&collection_name, path_prefix.as_deref())?;
+            let files = store
+                .list_files(&collection_name, path_prefix.as_deref())
+                .await?;
 
             if files.is_empty() {
                 if let Some(prefix) = path_prefix {
@@ -468,16 +472,16 @@ fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_index(db_path: &Path, name: Option<&str>) -> Result<()> {
-    let store = Store::open(db_path)?;
+async fn cmd_index(db_path: &Path, name: Option<&str>) -> Result<()> {
+    let store = Store::open(db_path).await?;
     let indexer = Indexer::new(&store);
 
     let stats = if let Some(collection_name) = name {
         println!("Indexing collection '{}'...", collection_name);
-        indexer.index_collection(collection_name)?
+        indexer.index_collection(collection_name).await?
     } else {
         println!("Indexing all collections...");
-        indexer.index_all()?
+        indexer.index_all().await?
     };
 
     println!(
@@ -492,7 +496,7 @@ fn cmd_index(db_path: &Path, name: Option<&str>) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_search(
+async fn cmd_search(
     db_path: &Path,
     query: &str,
     mode: &str,
@@ -502,7 +506,7 @@ fn cmd_search(
     include_binary: bool,
     format: &str,
 ) -> Result<()> {
-    let store = Store::open(db_path)?;
+    let store = Store::open(db_path).await?;
 
     let search_mode: SearchMode = mode.parse()?;
     let options = SearchOptions {
@@ -514,7 +518,7 @@ fn cmd_search(
     };
 
     let searcher = qfs::search::Searcher::new(&store);
-    let results = searcher.search(query, options)?;
+    let results = searcher.search(query, options).await?;
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&results)?);
@@ -537,7 +541,7 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_get(
+async fn cmd_get(
     db_path: &Path,
     path: &str,
     from_line: Option<usize>,
@@ -545,7 +549,7 @@ fn cmd_get(
     line_numbers: bool,
     format: &str,
 ) -> Result<()> {
-    let store = Store::open(db_path)?;
+    let store = Store::open(db_path).await?;
 
     // Parse :linenum suffix if --from not provided
     let (clean_path, suffix_line) = qfs::parse_path_with_line(path);
@@ -553,18 +557,18 @@ fn cmd_get(
 
     // Check if input is a docid
     let doc = if qfs::store::is_docid(clean_path) {
-        store.get_document_by_docid(clean_path)?
+        store.get_document_by_docid(clean_path).await?
     } else {
         // Parse path as collection/relative_path
         let parts: Vec<&str> = clean_path.splitn(2, '/').collect();
         if parts.len() != 2 {
             anyhow::bail!("Path must be in format 'collection/relative_path' or docid");
         }
-        store.get_document(parts[0], parts[1])?
+        store.get_document(parts[0], parts[1]).await?
     };
 
     // Get content
-    let content = store.get_content(&doc.hash)?;
+    let content = store.get_content(&doc.hash).await?;
     let text = String::from_utf8(content.data.clone())
         .map_err(|_| anyhow::anyhow!("Content is not valid UTF-8"))?;
 
@@ -600,15 +604,15 @@ fn cmd_get(
     Ok(())
 }
 
-fn cmd_multi_get(
+async fn cmd_multi_get(
     db_path: &Path,
     pattern: &str,
     max_bytes: usize,
     max_lines: Option<usize>,
     format: &str,
 ) -> Result<()> {
-    let store = Store::open(db_path)?;
-    let results = store.multi_get(pattern, max_bytes, max_lines)?;
+    let store = Store::open(db_path).await?;
+    let results = store.multi_get(pattern, max_bytes, max_lines).await?;
 
     if results.is_empty() {
         println!("No files matched pattern: {}", pattern);
@@ -637,15 +641,15 @@ fn cmd_multi_get(
     Ok(())
 }
 
-fn cmd_status(db_path: &Path) -> Result<()> {
+async fn cmd_status(db_path: &Path) -> Result<()> {
     if !db_path.exists() {
         println!("Database not initialized. Run 'qfs init' first.");
         return Ok(());
     }
 
-    let store = Store::open(db_path)?;
-    let collections = store.list_collections()?;
-    let total_docs = store.count_documents(None)?;
+    let store = Store::open(db_path).await?;
+    let collections = store.list_collections().await?;
+    let total_docs = store.count_documents(None).await?;
 
     println!("QFS Status");
     println!("===========");
@@ -656,7 +660,7 @@ fn cmd_status(db_path: &Path) -> Result<()> {
     if !collections.is_empty() {
         println!("\nPer-collection stats:");
         for col in collections {
-            let count = store.count_documents(Some(&col.name)).unwrap_or(0);
+            let count = store.count_documents(Some(&col.name)).await.unwrap_or(0);
             println!("  {}: {} documents", col.name, count);
         }
     }
@@ -664,9 +668,9 @@ fn cmd_status(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(db_path: &Path) -> Result<()> {
-    let server = mcp::McpServer::new(db_path)?;
-    Ok(server.run()?)
+async fn cmd_serve(db_path: &Path) -> Result<()> {
+    let server = mcp::McpServer::new(db_path).await?;
+    Ok(server.run().await?)
 }
 
 /// Parse context path into (collection, path_prefix)
@@ -695,13 +699,15 @@ fn parse_context_path(path: &str) -> (Option<String>, String) {
     }
 }
 
-fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
-    let store = Store::open(db_path)?;
+async fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
+    let store = Store::open(db_path).await?;
 
     match action {
         ContextAction::Add { path, description } => {
             let (collection, path_prefix) = parse_context_path(&path);
-            store.set_context(collection.as_deref(), &path_prefix, &description)?;
+            store
+                .set_context(collection.as_deref(), &path_prefix, &description)
+                .await?;
 
             if let Some(coll) = collection {
                 println!("Added context for {}/{}", coll, path_prefix);
@@ -711,7 +717,7 @@ fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
         }
 
         ContextAction::List => {
-            let contexts = store.list_contexts()?;
+            let contexts = store.list_contexts().await?;
 
             if contexts.is_empty() {
                 println!("No contexts defined. Use 'qfs context add' to add context.");
@@ -736,14 +742,14 @@ fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
         }
 
         ContextAction::Check => {
-            let without_context = store.get_collections_without_context()?;
+            let without_context = store.get_collections_without_context().await?;
 
             if without_context.is_empty() {
                 println!("All collections have context defined.");
             } else {
                 println!("Collections without context:\n");
                 for coll in without_context {
-                    let doc_count = store.count_documents(Some(&coll.name)).unwrap_or(0);
+                    let doc_count = store.count_documents(Some(&coll.name)).await.unwrap_or(0);
                     println!("  {} ({} files)", coll.name, doc_count);
                     println!(
                         "    Suggested: qfs context add {} \"Description here\"",
@@ -755,7 +761,10 @@ fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
 
         ContextAction::Rm { path } => {
             let (collection, path_prefix) = parse_context_path(&path);
-            if store.remove_context(collection.as_deref(), &path_prefix)? {
+            if store
+                .remove_context(collection.as_deref(), &path_prefix)
+                .await?
+            {
                 println!("Removed context for {}", path);
             } else {
                 println!("No context found for {}", path);

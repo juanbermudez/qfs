@@ -1,4 +1,6 @@
 //! Search functionality for QFS
+//!
+//! Provides BM25, vector, and hybrid search across indexed documents.
 
 use crate::error::{Error, Result};
 use crate::store::Store;
@@ -114,104 +116,107 @@ impl<'a> Searcher<'a> {
     }
 
     /// Search for documents
-    pub fn search(&self, query: &str, options: SearchOptions) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, query: &str, options: SearchOptions) -> Result<Vec<SearchResult>> {
         match options.mode {
-            SearchMode::Bm25 => self.search_bm25(query, &options),
-            SearchMode::Vector => self.search_vector(query, &options),
-            SearchMode::Hybrid => self.search_hybrid(query, &options),
+            SearchMode::Bm25 => self.search_bm25(query, &options).await,
+            SearchMode::Vector => self.search_vector(query, &options).await,
+            SearchMode::Hybrid => self.search_hybrid(query, &options).await,
         }
     }
 
     /// BM25 full-text search using FTS5
-    fn search_bm25(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
-        // Sanitize query for FTS5
+    async fn search_bm25(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
         let fts_query = sanitize_fts_query(query);
 
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Execute search via Store
-        let rows = self.store.search_bm25(
-            &fts_query,
-            options.collection.as_deref(),
-            options.limit,
-            options.include_binary,
-        )?;
+        let rows = self
+            .store
+            .search_bm25(
+                &fts_query,
+                options.collection.as_deref(),
+                options.limit,
+                options.include_binary,
+            )
+            .await?;
 
-        // Convert rows to SearchResults with score normalization
-        let results: Vec<SearchResult> = rows
-            .into_iter()
-            .map(|row| {
-                let normalized_score = normalize_bm25_score(row.bm25_score);
+        let mut results = Vec::with_capacity(rows.len());
 
-                // Determine if binary
-                let is_binary = row.content_type.starts_with("application/octet")
-                    || row.content_type.starts_with("image/")
-                    || row.content_type.starts_with("audio/")
-                    || row.content_type.starts_with("video/");
+        for row in rows {
+            let normalized_score = normalize_bm25_score(row.bm25_score);
 
-                // Extract filename from path
-                let name = std::path::Path::new(&row.path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&row.path)
-                    .to_string();
+            if normalized_score < options.min_score {
+                continue;
+            }
 
-                // Build content pointer for binary files
-                let content_pointer = if is_binary {
-                    // Would need collection path to build file:// URL
-                    // For now, return the relative path
-                    Some(format!("{}/{}", row.collection, row.path))
-                } else {
-                    None
-                };
+            let is_binary = row.content_type.starts_with("application/octet")
+                || row.content_type.starts_with("image/")
+                || row.content_type.starts_with("audio/")
+                || row.content_type.starts_with("video/");
 
-                // Get context for this path
-                let context = self
-                    .store
-                    .get_all_contexts_for_path(&row.collection, &row.path)
-                    .ok()
-                    .map(|contexts| contexts.join("\n\n"))
-                    .filter(|s| !s.is_empty());
+            let name = std::path::Path::new(&row.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&row.path)
+                .to_string();
 
-                SearchResult {
-                    id: row.id,
-                    path: format!("{}/{}", row.collection, row.path),
-                    name,
-                    mime_type: row.content_type,
-                    file_size: row.size,
-                    is_binary,
-                    score: normalized_score,
-                    content: None, // Content loaded separately if needed
-                    content_pointer,
-                    snippet: row.snippet,
-                    line_start: None, // Could parse from snippet
-                    collection: row.collection,
-                    title: row.title,
-                    docid: Some(format!("#{}", crate::store::get_docid(&row.hash))),
-                    chunk_index: None,
-                    context,
-                }
-            })
-            .filter(|r| r.score >= options.min_score)
-            .collect();
+            let content_pointer = if is_binary {
+                Some(format!("{}/{}", row.collection, row.path))
+            } else {
+                None
+            };
+
+            let context = self
+                .store
+                .get_all_contexts_for_path(&row.collection, &row.path)
+                .await
+                .ok()
+                .map(|contexts| contexts.join("\n\n"))
+                .filter(|s| !s.is_empty());
+
+            results.push(SearchResult {
+                id: row.id,
+                path: format!("{}/{}", row.collection, row.path),
+                name,
+                mime_type: row.content_type,
+                file_size: row.size,
+                is_binary,
+                score: normalized_score,
+                content: None,
+                content_pointer,
+                snippet: row.snippet,
+                line_start: None,
+                collection: row.collection,
+                title: row.title,
+                docid: Some(format!("#{}", crate::store::get_docid(&row.hash))),
+                chunk_index: None,
+                context,
+            });
+        }
 
         Ok(results)
     }
 
     /// Vector semantic search
-    fn search_vector(&self, _query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
-        // Check if any embeddings exist
-        let embed_count = self.store.count_embeddings(options.collection.as_deref())?;
+    async fn search_vector(
+        &self,
+        _query: &str,
+        options: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        let embed_count = self
+            .store
+            .count_embeddings(options.collection.as_deref())
+            .await?;
         if embed_count == 0 {
             return Err(Error::EmbeddingsRequired);
         }
 
-        // For vector search, we need the query embedding
-        // This would be provided externally or computed here
-        // For now, return an error indicating embeddings are needed
-        // The actual search happens in search_vector_with_embedding
         Err(Error::EmbeddingError(
             "Vector search requires query embedding. Use search_vector_with_embedding() instead."
                 .to_string(),
@@ -219,23 +224,22 @@ impl<'a> Searcher<'a> {
     }
 
     /// Vector search with pre-computed query embedding
-    pub fn search_vector_with_embedding(
+    pub async fn search_vector_with_embedding(
         &self,
         query_embedding: &[f32],
         options: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        // Get all embeddings
         let embeddings = self
             .store
-            .get_all_embeddings_for_search(options.collection.as_deref())?;
+            .get_all_embeddings_for_search(options.collection.as_deref())
+            .await?;
 
         if embeddings.is_empty() {
             return Err(Error::EmbeddingsRequired);
         }
 
-        // Calculate similarities
-        let mut scored: Vec<(f64, &crate::store::EmbeddingSearchRow)> = embeddings
-            .iter()
+        let mut scored: Vec<(f64, crate::store::EmbeddingSearchRow)> = embeddings
+            .into_iter()
             .map(|row| {
                 let embedding = bytes_to_embedding(&row.embedding);
                 let similarity = cosine_similarity(query_embedding, &embedding);
@@ -243,63 +247,66 @@ impl<'a> Searcher<'a> {
             })
             .collect();
 
-        // Sort by similarity (descending)
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Take top results
-        let results: Vec<SearchResult> = scored
-            .into_iter()
-            .take(options.limit)
-            .filter(|(score, _)| *score >= options.min_score)
-            .map(|(score, row)| {
-                let name = std::path::Path::new(&row.path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&row.path)
-                    .to_string();
+        let mut results = Vec::new();
 
-                // Get context for this path
-                let context = self
-                    .store
-                    .get_all_contexts_for_path(&row.collection, &row.path)
-                    .ok()
-                    .map(|contexts| contexts.join("\n\n"))
-                    .filter(|s| !s.is_empty());
+        for (score, row) in scored.into_iter().take(options.limit) {
+            if score < options.min_score {
+                continue;
+            }
 
-                SearchResult {
-                    id: row.doc_id,
-                    path: format!("{}/{}", row.collection, row.path),
-                    name,
-                    mime_type: "text/plain".to_string(), // We'd need to look this up
-                    file_size: 0,
-                    is_binary: false,
-                    score,
-                    content: None,
-                    content_pointer: None,
-                    snippet: None,
-                    line_start: None,
-                    collection: row.collection.clone(),
-                    title: row.title.clone(),
-                    docid: Some(format!("#{}", crate::store::get_docid(&row.hash))),
-                    chunk_index: Some(row.chunk_index),
-                    context,
-                }
-            })
-            .collect();
+            let name = std::path::Path::new(&row.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&row.path)
+                .to_string();
+
+            let context = self
+                .store
+                .get_all_contexts_for_path(&row.collection, &row.path)
+                .await
+                .ok()
+                .map(|contexts| contexts.join("\n\n"))
+                .filter(|s| !s.is_empty());
+
+            results.push(SearchResult {
+                id: row.doc_id,
+                path: format!("{}/{}", row.collection, row.path),
+                name,
+                mime_type: "text/plain".to_string(),
+                file_size: 0,
+                is_binary: false,
+                score,
+                content: None,
+                content_pointer: None,
+                snippet: None,
+                line_start: None,
+                collection: row.collection,
+                title: row.title,
+                docid: Some(format!("#{}", crate::store::get_docid(&row.hash))),
+                chunk_index: Some(row.chunk_index),
+                context,
+            });
+        }
 
         Ok(results)
     }
 
     /// Hybrid search combining BM25 and vector with RRF
-    fn search_hybrid(&self, _query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
-        // Check if embeddings are available
-        let embed_count = self.store.count_embeddings(options.collection.as_deref())?;
+    async fn search_hybrid(
+        &self,
+        _query: &str,
+        options: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        let embed_count = self
+            .store
+            .count_embeddings(options.collection.as_deref())
+            .await?;
         if embed_count == 0 {
             return Err(Error::EmbeddingsRequired);
         }
 
-        // For hybrid search, we need the query embedding
-        // This would be provided externally
         Err(Error::EmbeddingError(
             "Hybrid search requires query embedding. Use search_hybrid_with_embedding() instead."
                 .to_string(),
@@ -307,38 +314,33 @@ impl<'a> Searcher<'a> {
     }
 
     /// Hybrid search with pre-computed query embedding
-    pub fn search_hybrid_with_embedding(
+    pub async fn search_hybrid_with_embedding(
         &self,
         query: &str,
         query_embedding: &[f32],
         options: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        // Get BM25 results
         let bm25_options = SearchOptions {
-            limit: options.limit * 2, // Get more for fusion
+            limit: options.limit * 2,
             ..options.clone()
         };
-        let bm25_results = self.search_bm25(query, &bm25_options)?;
+        let bm25_results = self.search_bm25(query, &bm25_options).await?;
 
-        // Get vector results
         let vector_options = SearchOptions {
             limit: options.limit * 2,
             ..options.clone()
         };
-        let vector_results = self.search_vector_with_embedding(query_embedding, &vector_options)?;
+        let vector_results = self
+            .search_vector_with_embedding(query_embedding, &vector_options)
+            .await?;
 
-        // Apply Reciprocal Rank Fusion (RRF)
         let fused = reciprocal_rank_fusion(&bm25_results, &vector_results, 60.0);
 
-        // Take top results
         Ok(fused.into_iter().take(options.limit).collect())
     }
 }
 
 /// Apply Reciprocal Rank Fusion (RRF) to combine two result sets
-///
-/// RRF score = 1 / (k + rank)
-/// where k is a constant (typically 60)
 fn reciprocal_rank_fusion(
     bm25_results: &[SearchResult],
     vector_results: &[SearchResult],
@@ -346,7 +348,6 @@ fn reciprocal_rank_fusion(
 ) -> Vec<SearchResult> {
     let mut scores: HashMap<i64, (f64, Option<SearchResult>)> = HashMap::new();
 
-    // Add BM25 scores
     for (rank, result) in bm25_results.iter().enumerate() {
         let rrf_score = 1.0 / (k + rank as f64 + 1.0);
         scores.entry(result.id).or_insert((0.0, None)).0 += rrf_score;
@@ -355,7 +356,6 @@ fn reciprocal_rank_fusion(
         }
     }
 
-    // Add vector scores
     for (rank, result) in vector_results.iter().enumerate() {
         let rrf_score = 1.0 / (k + rank as f64 + 1.0);
         scores.entry(result.id).or_insert((0.0, None)).0 += rrf_score;
@@ -364,7 +364,6 @@ fn reciprocal_rank_fusion(
         }
     }
 
-    // Sort by combined score
     let mut results: Vec<_> = scores
         .into_iter()
         .filter_map(|(_, (score, result))| {
@@ -385,10 +384,6 @@ fn reciprocal_rank_fusion(
 }
 
 /// Sanitize a query string for FTS5
-///
-/// - Removes special characters
-/// - Adds prefix matching (term -> "term"*)
-/// - Handles AND/OR operators
 fn sanitize_fts_query(query: &str) -> String {
     let query = query.trim();
 
@@ -396,18 +391,15 @@ fn sanitize_fts_query(query: &str) -> String {
         return String::new();
     }
 
-    // Split into terms
     let terms: Vec<&str> = query.split_whitespace().filter(|t| !t.is_empty()).collect();
 
     if terms.is_empty() {
         return String::new();
     }
 
-    // Build FTS5 query with prefix matching
     let fts_terms: Vec<String> = terms
         .iter()
         .map(|term| {
-            // Remove special FTS5 characters
             let clean: String = term
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
@@ -417,7 +409,6 @@ fn sanitize_fts_query(query: &str) -> String {
                 return String::new();
             }
 
-            // Add prefix matching
             format!("\"{}\"*", clean)
         })
         .filter(|t| !t.is_empty())
@@ -427,14 +418,10 @@ fn sanitize_fts_query(query: &str) -> String {
         return String::new();
     }
 
-    // Join with AND
     fts_terms.join(" AND ")
 }
 
 /// Normalize BM25 score to 0-1 range
-///
-/// FTS5 BM25 returns negative scores where lower is better.
-/// This converts to 0-1 where higher is better.
 pub fn normalize_bm25_score(bm25_score: f64) -> f64 {
     1.0 / (1.0 + bm25_score.abs())
 }
@@ -495,10 +482,7 @@ mod tests {
 
     #[test]
     fn test_normalize_bm25_score() {
-        // BM25 of 0 -> score of 1.0
         assert!((normalize_bm25_score(0.0) - 1.0).abs() < 0.001);
-
-        // More negative BM25 -> lower score (but still positive)
         assert!(normalize_bm25_score(-5.0) < normalize_bm25_score(-1.0));
         assert!(normalize_bm25_score(-10.0) < normalize_bm25_score(-5.0));
     }
@@ -621,15 +605,12 @@ mod tests {
 
         let fused = reciprocal_rank_fusion(&bm25, &vector, 60.0);
 
-        // Document 2 appears in both, should be ranked higher
         assert_eq!(fused.len(), 3);
 
-        // Find doc 2's score - it should have contributions from both rankings
         let doc2 = fused.iter().find(|r| r.id == 2).unwrap();
         let doc1 = fused.iter().find(|r| r.id == 1).unwrap();
         let doc3 = fused.iter().find(|r| r.id == 3).unwrap();
 
-        // Doc 2 should have higher score since it's in both result sets
         assert!(doc2.score > doc1.score);
         assert!(doc2.score > doc3.score);
     }

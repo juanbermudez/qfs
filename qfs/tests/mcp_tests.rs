@@ -10,7 +10,7 @@ use std::io::Write;
 use tempfile::tempdir;
 
 /// Create a test server with indexed documents
-fn create_test_server_with_docs() -> (Store, tempfile::TempDir, tempfile::TempDir) {
+async fn create_test_server_with_docs() -> (Store, tempfile::TempDir, tempfile::TempDir) {
     let db_dir = tempdir().unwrap();
     let content_dir = tempdir().unwrap();
 
@@ -33,26 +33,29 @@ fn create_test_server_with_docs() -> (Store, tempfile::TempDir, tempfile::TempDi
     }
 
     // Create store and index
-    let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+    let store = Store::open(db_dir.path().join("test.sqlite"))
+        .await
+        .unwrap();
     store
         .add_collection("docs", content_dir.path().to_str().unwrap(), &["**/*.md"])
+        .await
         .unwrap();
 
     let indexer = Indexer::new(&store);
-    indexer.index_collection("docs").unwrap();
+    indexer.index_collection("docs").await.unwrap();
 
     (store, db_dir, content_dir)
 }
 
-#[test]
-fn test_mcp_server_creation() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_mcp_server_creation() {
+    let store = Store::open_memory().await.unwrap();
     let _server = McpServer::with_store(store);
     // Server creation should succeed (no panic)
 }
 
-#[test]
-fn test_mcp_tools_list() {
+#[tokio::test]
+async fn test_mcp_tools_list() {
     // The tools list should contain 6 tools
     let tools = qfs::mcp::tools::get_tool_definitions();
     assert_eq!(tools.len(), 6);
@@ -67,11 +70,12 @@ fn test_mcp_tools_list() {
     assert!(names.contains(&"qfs_status"));
 }
 
-#[test]
-fn test_mcp_search_tool_empty_results() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_mcp_search_tool_empty_results() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("test", "/tmp/test", &["**/*.md"])
+        .await
         .unwrap();
 
     // Test search with empty results
@@ -82,16 +86,17 @@ fn test_mcp_search_tool_empty_results() {
             "query": "nonexistent",
             "limit": 10
         }),
-    );
+    )
+    .await;
 
     assert!(result.is_ok());
     let tool_result = result.unwrap();
     assert!(!tool_result.content.is_empty());
 }
 
-#[test]
-fn test_mcp_search_with_results() {
-    let (store, _db_dir, _content_dir) = create_test_server_with_docs();
+#[tokio::test]
+async fn test_mcp_search_with_results() {
+    let (store, _db_dir, _content_dir) = create_test_server_with_docs().await;
 
     let result = qfs::mcp::tools::handle_tool_call(
         &store,
@@ -100,7 +105,8 @@ fn test_mcp_search_with_results() {
             "query": "rust",
             "limit": 10
         }),
-    );
+    )
+    .await;
 
     assert!(result.is_ok());
     let tool_result = result.unwrap();
@@ -110,14 +116,15 @@ fn test_mcp_search_with_results() {
     assert!(text.contains("rust_guide"), "Should find rust_guide.md");
 }
 
-#[test]
-fn test_mcp_status_tool() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_mcp_status_tool() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("test", "/tmp/test", &["**/*.md"])
+        .await
         .unwrap();
 
-    let result = qfs::mcp::tools::handle_tool_call(&store, "qfs_status", &json!({}));
+    let result = qfs::mcp::tools::handle_tool_call(&store, "qfs_status", &json!({})).await;
 
     assert!(result.is_ok());
     let tool_result = result.unwrap();
@@ -128,8 +135,8 @@ fn test_mcp_status_tool() {
     assert!(text.contains("totalCollections"));
 }
 
-#[test]
-fn test_mcp_get_tool() {
+#[tokio::test]
+async fn test_mcp_get_tool() {
     let db_dir = tempdir().unwrap();
     let content_dir = tempdir().unwrap();
 
@@ -139,13 +146,16 @@ fn test_mcp_get_tool() {
     file.write_all(b"# Test Document\n\nSome content here.")
         .unwrap();
 
-    let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+    let store = Store::open(db_dir.path().join("test.sqlite"))
+        .await
+        .unwrap();
     store
         .add_collection("docs", content_dir.path().to_str().unwrap(), &["**/*.md"])
+        .await
         .unwrap();
 
     let indexer = Indexer::new(&store);
-    indexer.index_collection("docs").unwrap();
+    indexer.index_collection("docs").await.unwrap();
 
     // Test get tool
     let result = qfs::mcp::tools::handle_tool_call(
@@ -155,7 +165,8 @@ fn test_mcp_get_tool() {
             "path": "docs/test.md",
             "include_content": true
         }),
-    );
+    )
+    .await;
 
     assert!(result.is_ok());
     let tool_result = result.unwrap();
@@ -165,9 +176,9 @@ fn test_mcp_get_tool() {
     assert!(text.contains("Test Document"));
 }
 
-#[test]
-fn test_mcp_get_invalid_path() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_mcp_get_invalid_path() {
+    let store = Store::open_memory().await.unwrap();
 
     let result = qfs::mcp::tools::handle_tool_call(
         &store,
@@ -175,15 +186,16 @@ fn test_mcp_get_invalid_path() {
         &json!({
             "path": "invalid-no-slash"
         }),
-    );
+    )
+    .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.message.contains("format"));
 }
 
-#[test]
-fn test_mcp_multi_get_tool() {
+#[tokio::test]
+async fn test_mcp_multi_get_tool() {
     let db_dir = tempdir().unwrap();
     let content_dir = tempdir().unwrap();
 
@@ -196,13 +208,16 @@ fn test_mcp_multi_get_tool() {
     let mut f2 = File::create(&file2).unwrap();
     f2.write_all(b"# Document 2").unwrap();
 
-    let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+    let store = Store::open(db_dir.path().join("test.sqlite"))
+        .await
+        .unwrap();
     store
         .add_collection("docs", content_dir.path().to_str().unwrap(), &["**/*.md"])
+        .await
         .unwrap();
 
     let indexer = Indexer::new(&store);
-    indexer.index_collection("docs").unwrap();
+    indexer.index_collection("docs").await.unwrap();
 
     // Test multi_get tool with comma-separated pattern
     let result = qfs::mcp::tools::handle_tool_call(
@@ -212,7 +227,8 @@ fn test_mcp_multi_get_tool() {
             "pattern": "docs/doc1.md, docs/doc2.md",
             "max_bytes": 10240
         }),
-    );
+    )
+    .await;
 
     assert!(result.is_ok());
     let tool_result = result.unwrap();
@@ -223,11 +239,12 @@ fn test_mcp_multi_get_tool() {
     assert!(text.contains("Document 2"));
 }
 
-#[test]
-fn test_mcp_query_tool_with_mode() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_mcp_query_tool_with_mode() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("test", "/tmp/test", &["**/*.md"])
+        .await
         .unwrap();
 
     // Test query with bm25 mode
@@ -239,16 +256,17 @@ fn test_mcp_query_tool_with_mode() {
             "mode": "bm25",
             "limit": 10
         }),
-    );
+    )
+    .await;
 
     assert!(result.is_ok());
 }
 
-#[test]
-fn test_mcp_unknown_tool() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_mcp_unknown_tool() {
+    let store = Store::open_memory().await.unwrap();
 
-    let result = qfs::mcp::tools::handle_tool_call(&store, "unknown_tool", &json!({}));
+    let result = qfs::mcp::tools::handle_tool_call(&store, "unknown_tool", &json!({})).await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -256,24 +274,25 @@ fn test_mcp_unknown_tool() {
     assert!(err.message.contains("Unknown tool"));
 }
 
-#[test]
-fn test_mcp_missing_required_param() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_mcp_missing_required_param() {
+    let store = Store::open_memory().await.unwrap();
 
     // qfs_search requires "query" param
     let result = qfs::mcp::tools::handle_tool_call(
         &store,
         "qfs_search",
         &json!({"limit": 10}), // missing query
-    );
+    )
+    .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.message.contains("Missing query"));
 }
 
-#[test]
-fn test_mcp_protocol_types() {
+#[tokio::test]
+async fn test_mcp_protocol_types() {
     use qfs::mcp::{JsonRpcError, JsonRpcResponse};
 
     // Test error creation
@@ -291,11 +310,12 @@ fn test_mcp_protocol_types() {
     assert!(error.error.is_some());
 }
 
-#[test]
-fn test_mcp_vsearch_requires_embeddings() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_mcp_vsearch_requires_embeddings() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("test", "/tmp/test", &["**/*.md"])
+        .await
         .unwrap();
 
     // Vector search should fail without embeddings
@@ -306,7 +326,8 @@ fn test_mcp_vsearch_requires_embeddings() {
             "query": "test",
             "limit": 10
         }),
-    );
+    )
+    .await;
 
     // Should return an error about embeddings
     assert!(result.is_err());
@@ -314,9 +335,9 @@ fn test_mcp_vsearch_requires_embeddings() {
     assert!(err.message.contains("embeddings") || err.message.contains("Embedding"));
 }
 
-#[test]
-fn test_mcp_search_with_collection_filter() {
-    let (store, _db_dir, _content_dir) = create_test_server_with_docs();
+#[tokio::test]
+async fn test_mcp_search_with_collection_filter() {
+    let (store, _db_dir, _content_dir) = create_test_server_with_docs().await;
 
     // Search in the docs collection
     let result = qfs::mcp::tools::handle_tool_call(
@@ -327,7 +348,8 @@ fn test_mcp_search_with_collection_filter() {
             "collection": "docs",
             "limit": 10
         }),
-    );
+    )
+    .await;
 
     assert!(result.is_ok());
     let tool_result = result.unwrap();
@@ -337,8 +359,8 @@ fn test_mcp_search_with_collection_filter() {
     assert!(text.contains("python"));
 }
 
-#[test]
-fn test_mcp_tool_definitions_schema() {
+#[tokio::test]
+async fn test_mcp_tool_definitions_schema() {
     let tools = qfs::mcp::tools::get_tool_definitions();
 
     for tool in &tools {

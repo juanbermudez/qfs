@@ -9,8 +9,8 @@ use super::protocol::{
 use super::tools::{get_tool_definitions, handle_tool_call};
 use crate::store::Store;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// MCP server for QFS
 ///
@@ -22,8 +22,8 @@ pub struct McpServer {
 
 impl McpServer {
     /// Create a new MCP server with a database path
-    pub fn new<P: AsRef<Path>>(db_path: P) -> crate::Result<Self> {
-        let store = Store::open(db_path)?;
+    pub async fn new<P: AsRef<Path>>(db_path: P) -> crate::Result<Self> {
+        let store = Store::open(db_path).await?;
         Ok(Self { store })
     }
 
@@ -36,38 +36,41 @@ impl McpServer {
     ///
     /// This method blocks and handles requests until EOF is received
     /// or an error occurs.
-    pub fn run(&self) -> crate::Result<()> {
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        let mut reader = BufReader::new(stdin.lock());
-        let mut writer = stdout.lock();
+    pub async fn run(&self) -> crate::Result<()> {
+        let stdin = tokio::io::stdin();
+        let stdout = tokio::io::stdout();
+        let mut reader = BufReader::new(stdin);
+        let mut writer = stdout;
 
         tracing::info!(
             "QFS MCP server started (protocol version {})",
             MCP_PROTOCOL_VERSION
         );
 
+        let mut line = String::new();
         loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
+            line.clear();
+            match reader.read_line(&mut line).await {
                 Ok(0) => {
                     tracing::info!("EOF received, shutting down");
                     break;
                 }
                 Ok(_) => {
-                    let line = line.trim();
-                    if line.is_empty() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
                         continue;
                     }
 
-                    tracing::debug!("Received: {}", line);
+                    tracing::debug!("Received: {}", trimmed);
 
-                    match serde_json::from_str::<JsonRpcRequest>(line) {
+                    match serde_json::from_str::<JsonRpcRequest>(trimmed) {
                         Ok(request) => {
-                            let response = self.handle_request(request);
+                            let response = self.handle_request(request).await;
                             let response_json = serde_json::to_string(&response)?;
-                            writeln!(writer, "{}", response_json)?;
-                            writer.flush()?;
+                            writer
+                                .write_all(format!("{}\n", response_json).as_bytes())
+                                .await?;
+                            writer.flush().await?;
                             tracing::debug!("Sent: {}", response_json);
                         }
                         Err(e) => {
@@ -76,8 +79,10 @@ impl McpServer {
                                 JsonRpcError::parse_error(format!("Parse error: {}", e)),
                             );
                             let response_json = serde_json::to_string(&response)?;
-                            writeln!(writer, "{}", response_json)?;
-                            writer.flush()?;
+                            writer
+                                .write_all(format!("{}\n", response_json).as_bytes())
+                                .await?;
+                            writer.flush().await?;
                         }
                     }
                 }
@@ -92,15 +97,14 @@ impl McpServer {
     }
 
     /// Handle a single JSON-RPC request
-    fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(&request.params),
             "notifications/initialized" => {
-                // Client notification, acknowledge with empty result
                 return JsonRpcResponse::success(request.id, json!({}));
             }
             "tools/list" => self.handle_tools_list(),
-            "tools/call" => self.handle_tools_call(&request.params),
+            "tools/call" => self.handle_tools_call(&request.params).await,
             "ping" => Ok(json!({})),
             _ => Err(JsonRpcError::method_not_found(&request.method)),
         };
@@ -133,7 +137,7 @@ impl McpServer {
     }
 
     /// Handle tools/call request
-    fn handle_tools_call(
+    async fn handle_tools_call(
         &self,
         params: &Option<Value>,
     ) -> std::result::Result<Value, JsonRpcError> {
@@ -148,7 +152,7 @@ impl McpServer {
 
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-        let result: ToolResult = handle_tool_call(&self.store, tool_name, &arguments)?;
+        let result: ToolResult = handle_tool_call(&self.store, tool_name, &arguments).await?;
 
         serde_json::to_value(result).map_err(|e| JsonRpcError::server_error(e.to_string()))
     }
@@ -158,21 +162,20 @@ impl McpServer {
 mod tests {
     use super::*;
 
-    fn create_test_server() -> McpServer {
-        let store = Store::open_memory().unwrap();
+    async fn create_test_server() -> McpServer {
+        let store = Store::open_memory().await.unwrap();
         McpServer::with_store(store)
     }
 
-    #[test]
-    fn test_server_creation() {
-        let server = create_test_server();
-        // Server should be created successfully
+    #[tokio::test]
+    async fn test_server_creation() {
+        let server = create_test_server().await;
         assert!(server.handle_initialize(&None).is_ok());
     }
 
-    #[test]
-    fn test_initialize_response() {
-        let server = create_test_server();
+    #[tokio::test]
+    async fn test_initialize_response() {
+        let server = create_test_server().await;
         let result = server.handle_initialize(&None).unwrap();
 
         assert_eq!(result["protocolVersion"], MCP_PROTOCOL_VERSION);
@@ -181,35 +184,34 @@ mod tests {
         assert_eq!(result["serverInfo"]["name"], "qfs");
     }
 
-    #[test]
-    fn test_tools_list() {
-        let server = create_test_server();
+    #[tokio::test]
+    async fn test_tools_list() {
+        let server = create_test_server().await;
         let result = server.handle_tools_list().unwrap();
 
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 6);
 
-        // Verify tool names
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"qfs_search"));
         assert!(names.contains(&"qfs_status"));
     }
 
-    #[test]
-    fn test_tools_call_status() {
-        let server = create_test_server();
+    #[tokio::test]
+    async fn test_tools_call_status() {
+        let server = create_test_server().await;
         let params = json!({
             "name": "qfs_status",
             "arguments": {}
         });
 
-        let result = server.handle_tools_call(&Some(params)).unwrap();
+        let result = server.handle_tools_call(&Some(params)).await.unwrap();
         assert!(result["content"].is_array());
     }
 
-    #[test]
-    fn test_tools_call_search() {
-        let server = create_test_server();
+    #[tokio::test]
+    async fn test_tools_call_search() {
+        let server = create_test_server().await;
         let params = json!({
             "name": "qfs_search",
             "arguments": {
@@ -218,24 +220,24 @@ mod tests {
             }
         });
 
-        let result = server.handle_tools_call(&Some(params)).unwrap();
+        let result = server.handle_tools_call(&Some(params)).await.unwrap();
         assert!(result["content"].is_array());
     }
 
-    #[test]
-    fn test_tools_call_missing_name() {
-        let server = create_test_server();
+    #[tokio::test]
+    async fn test_tools_call_missing_name() {
+        let server = create_test_server().await;
         let params = json!({
             "arguments": {}
         });
 
-        let result = server.handle_tools_call(&Some(params));
+        let result = server.handle_tools_call(&Some(params)).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_unknown_method() {
-        let server = create_test_server();
+    #[tokio::test]
+    async fn test_unknown_method() {
+        let server = create_test_server().await;
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(1)),
@@ -243,14 +245,14 @@ mod tests {
             params: None,
         };
 
-        let response = server.handle_request(request);
+        let response = server.handle_request(request).await;
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, -32601);
     }
 
-    #[test]
-    fn test_ping() {
-        let server = create_test_server();
+    #[tokio::test]
+    async fn test_ping() {
+        let server = create_test_server().await;
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(1)),
@@ -258,14 +260,14 @@ mod tests {
             params: None,
         };
 
-        let response = server.handle_request(request);
+        let response = server.handle_request(request).await;
         assert!(response.result.is_some());
         assert!(response.error.is_none());
     }
 
-    #[test]
-    fn test_notification_initialized() {
-        let server = create_test_server();
+    #[tokio::test]
+    async fn test_notification_initialized() {
+        let server = create_test_server().await;
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(1)),
@@ -273,7 +275,7 @@ mod tests {
             params: None,
         };
 
-        let response = server.handle_request(request);
+        let response = server.handle_request(request).await;
         assert!(response.result.is_some());
         assert!(response.error.is_none());
     }

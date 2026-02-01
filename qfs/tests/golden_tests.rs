@@ -92,7 +92,7 @@ struct TestContext {
 }
 
 /// Set up test context with indexed corpus
-fn setup_test_context() -> TestContext {
+async fn setup_test_context() -> TestContext {
     let db_dir = tempdir().unwrap();
     let content_dir = tempdir().unwrap();
 
@@ -111,18 +111,19 @@ fn setup_test_context() -> TestContext {
     }
 
     // Create store and add collection
-    let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+    let store = Store::open(db_dir.path().join("test.sqlite")).await.unwrap();
     store
         .add_collection(
             "corpus",
             content_dir.path().to_str().unwrap(),
             &["**/*.md", "**/*.rs", "**/*.ts"],
         )
+        .await
         .unwrap();
 
     // Index the collection
     let indexer = Indexer::new(&store);
-    let _stats = indexer.index_collection("corpus").unwrap();
+    let _stats = indexer.index_collection("corpus").await.unwrap();
 
     TestContext {
         store,
@@ -172,7 +173,7 @@ fn save_golden<T: Serialize>(name: &str, data: &T) {
 }
 
 /// Execute a search and return results
-fn execute_search(
+async fn execute_search(
     store: &Store,
     query: &str,
     mode: SearchMode,
@@ -188,6 +189,7 @@ fn execute_search(
                 ..Default::default()
             },
         )
+        .await
         .unwrap_or_default();
 
     results
@@ -270,9 +272,9 @@ fn verify_golden_search(
 // Golden Tests
 // =============================================================================
 
-#[test]
-fn test_golden_search_basic() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_search_basic() {
+    let ctx = setup_test_context().await;
     let golden_file = "search_basic.golden.json";
 
     let queries = vec![
@@ -287,7 +289,7 @@ fn test_golden_search_basic() {
         let mut goldens = Vec::new();
 
         for (query, mode) in &queries {
-            let results = execute_search(&ctx.store, query, *mode, 20);
+            let results = execute_search(&ctx.store, query, *mode, 20).await;
 
             goldens.push(GoldenSearch {
                 query: query.to_string(),
@@ -326,7 +328,7 @@ fn test_golden_search_basic() {
             _ => SearchMode::Bm25,
         };
 
-        let results = execute_search(&ctx.store, &golden.query, mode, 20);
+        let results = execute_search(&ctx.store, &golden.query, mode, 20).await;
 
         if let Err(e) = verify_golden_search(&results, golden) {
             panic!(
@@ -337,9 +339,9 @@ fn test_golden_search_basic() {
     }
 }
 
-#[test]
-fn test_golden_search_multiword() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_search_multiword() {
+    let ctx = setup_test_context().await;
     let golden_file = "search_multiword.golden.json";
 
     let queries = vec![
@@ -353,7 +355,7 @@ fn test_golden_search_multiword() {
         let mut goldens = Vec::new();
 
         for (query, mode) in &queries {
-            let results = execute_search(&ctx.store, query, *mode, 20);
+            let results = execute_search(&ctx.store, query, *mode, 20).await;
 
             goldens.push(GoldenSearch {
                 query: query.to_string(),
@@ -391,7 +393,7 @@ fn test_golden_search_multiword() {
             _ => SearchMode::Bm25,
         };
 
-        let results = execute_search(&ctx.store, &golden.query, mode, 20);
+        let results = execute_search(&ctx.store, &golden.query, mode, 20).await;
 
         if let Err(e) = verify_golden_search(&results, golden) {
             panic!(
@@ -402,9 +404,9 @@ fn test_golden_search_multiword() {
     }
 }
 
-#[test]
-fn test_golden_search_code() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_search_code() {
+    let ctx = setup_test_context().await;
     let golden_file = "search_code.golden.json";
 
     let queries = vec![
@@ -418,7 +420,7 @@ fn test_golden_search_code() {
         let mut goldens = Vec::new();
 
         for (query, mode) in &queries {
-            let results = execute_search(&ctx.store, query, *mode, 20);
+            let results = execute_search(&ctx.store, query, *mode, 20).await;
 
             goldens.push(GoldenSearch {
                 query: query.to_string(),
@@ -456,7 +458,7 @@ fn test_golden_search_code() {
             _ => SearchMode::Bm25,
         };
 
-        let results = execute_search(&ctx.store, &golden.query, mode, 20);
+        let results = execute_search(&ctx.store, &golden.query, mode, 20).await;
 
         if let Err(e) = verify_golden_search(&results, golden) {
             panic!(
@@ -467,13 +469,13 @@ fn test_golden_search_code() {
     }
 }
 
-#[test]
-fn test_golden_index_stats() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_index_stats() {
+    let ctx = setup_test_context().await;
     let golden_file = "index_stats.golden.json";
 
-    let doc_count = ctx.store.count_documents(Some("corpus")).unwrap();
-    let collections = ctx.store.list_collections().unwrap();
+    let doc_count = ctx.store.count_documents(Some("corpus")).await.unwrap();
+    let collections = ctx.store.list_collections().await.unwrap();
 
     if should_update_golden() {
         let golden = GoldenIndexStats {
@@ -500,9 +502,9 @@ fn test_golden_index_stats() {
     );
 }
 
-#[test]
-fn test_golden_search_no_results() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_search_no_results() {
+    let ctx = setup_test_context().await;
 
     // These queries should return no results
     let queries = vec![
@@ -512,7 +514,7 @@ fn test_golden_search_no_results() {
     ];
 
     for query in queries {
-        let results = execute_search(&ctx.store, query, SearchMode::Bm25, 20);
+        let results = execute_search(&ctx.store, query, SearchMode::Bm25, 20).await;
 
         assert!(
             results.is_empty(),
@@ -523,15 +525,15 @@ fn test_golden_search_no_results() {
     }
 }
 
-#[test]
-fn test_golden_search_case_insensitive() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_search_case_insensitive() {
+    let ctx = setup_test_context().await;
 
     let test_cases = vec![("rust", "RUST"), ("async", "ASYNC"), ("memory", "Memory")];
 
     for (lower, upper) in test_cases {
-        let lower_results = execute_search(&ctx.store, lower, SearchMode::Bm25, 20);
-        let upper_results = execute_search(&ctx.store, upper, SearchMode::Bm25, 20);
+        let lower_results = execute_search(&ctx.store, lower, SearchMode::Bm25, 20).await;
+        let upper_results = execute_search(&ctx.store, upper, SearchMode::Bm25, 20).await;
 
         assert_eq!(
             lower_results.len(),
@@ -545,15 +547,15 @@ fn test_golden_search_case_insensitive() {
     }
 }
 
-#[test]
-fn test_golden_search_ranking_consistency() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_search_ranking_consistency() {
+    let ctx = setup_test_context().await;
 
     // Run same search multiple times, should get same results
     let query = "rust programming";
 
-    let results1 = execute_search(&ctx.store, query, SearchMode::Bm25, 20);
-    let results2 = execute_search(&ctx.store, query, SearchMode::Bm25, 20);
+    let results1 = execute_search(&ctx.store, query, SearchMode::Bm25, 20).await;
+    let results2 = execute_search(&ctx.store, query, SearchMode::Bm25, 20).await;
 
     assert_eq!(
         results1.len(),
@@ -570,14 +572,14 @@ fn test_golden_search_ranking_consistency() {
     }
 }
 
-#[test]
-fn test_golden_search_score_normalization() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_search_score_normalization() {
+    let ctx = setup_test_context().await;
 
     let queries = vec!["rust", "programming", "async await"];
 
     for query in queries {
-        let results = execute_search(&ctx.store, query, SearchMode::Bm25, 20);
+        let results = execute_search(&ctx.store, query, SearchMode::Bm25, 20).await;
 
         for result in &results {
             assert!(
@@ -605,15 +607,15 @@ fn test_golden_search_score_normalization() {
     }
 }
 
-#[test]
-fn test_golden_search_limit() {
-    let ctx = setup_test_context();
+#[tokio::test]
+async fn test_golden_search_limit() {
+    let ctx = setup_test_context().await;
 
     // Search with different limits
     let query = "programming"; // Should match multiple docs
 
     for limit in [1, 3, 5, 10] {
-        let results = execute_search(&ctx.store, query, SearchMode::Bm25, limit);
+        let results = execute_search(&ctx.store, query, SearchMode::Bm25, limit).await;
 
         assert!(
             results.len() <= limit,
@@ -625,10 +627,10 @@ fn test_golden_search_limit() {
 }
 
 /// Test that generates a detailed report of search results (for debugging)
-#[test]
+#[tokio::test]
 #[ignore] // Run with: cargo test --test golden_tests test_search_report -- --ignored --nocapture
-fn test_search_report() {
-    let ctx = setup_test_context();
+async fn test_search_report() {
+    let ctx = setup_test_context().await;
 
     let queries = vec![
         "rust",
@@ -643,7 +645,7 @@ fn test_search_report() {
     println!("\n=== QFS Search Quality Report ===\n");
 
     for query in queries {
-        let results = execute_search(&ctx.store, query, SearchMode::Bm25, 10);
+        let results = execute_search(&ctx.store, query, SearchMode::Bm25, 10).await;
 
         println!("Query: '{}' ({} results)", query, results.len());
         println!("{:-<60}", "");

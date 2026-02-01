@@ -15,8 +15,8 @@ keywords = ["search", "full-text", "vector", "embedding", "mcp"]
 categories = ["command-line-utilities", "database", "text-processing"]
 
 [workspace.dependencies]
-# SQLite and search (bundled includes FTS5 by default)
-rusqlite = { version = "0.32", features = ["bundled"] }
+# SQLite via libsql (async, native vector search)
+libsql = "0.6"
 
 # Embeddings (optional)
 fastembed = "4"

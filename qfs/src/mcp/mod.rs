@@ -18,8 +18,11 @@
 //! use qfs::mcp::McpServer;
 //! use std::path::PathBuf;
 //!
-//! let server = McpServer::new(&PathBuf::from("~/.cache/qfs/index.sqlite")).unwrap();
-//! server.run().unwrap();
+//! #[tokio::main]
+//! async fn main() {
+//!     let server = McpServer::new(&PathBuf::from("~/.cache/qfs/index.sqlite")).await.unwrap();
+//!     server.run().await.unwrap();
+//! }
 //! ```
 
 mod protocol;

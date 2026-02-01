@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum Error {
     /// Database error
     #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] libsql::Error),
 
     /// IO error
     #[error("IO error: {0}")]

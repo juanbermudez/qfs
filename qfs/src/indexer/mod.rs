@@ -58,12 +58,13 @@ impl<'a> Indexer<'a> {
     }
 
     /// Index a collection
-    pub fn index_collection(&self, name: &str) -> Result<IndexStats> {
+    pub async fn index_collection(&self, name: &str) -> Result<IndexStats> {
         self.index_collection_with_progress(name, &mut NoopProgress)
+            .await
     }
 
     /// Index a collection with progress reporting
-    pub fn index_collection_with_progress(
+    pub async fn index_collection_with_progress(
         &self,
         name: &str,
         progress: &mut dyn IndexProgress,
@@ -72,7 +73,7 @@ impl<'a> Indexer<'a> {
         let mut stats = IndexStats::default();
 
         // Get collection config
-        let collection = self.store.get_collection(name)?;
+        let collection = self.store.get_collection(name).await?;
 
         // Create scanner
         let patterns: Vec<&str> = collection.patterns.iter().map(|s| s.as_str()).collect();
@@ -87,7 +88,10 @@ impl<'a> Indexer<'a> {
             stats.files_scanned += 1;
             seen_paths.insert(scan_result.relative_path.clone());
 
-            match self.index_file(name, &scan_result.path, &scan_result.relative_path) {
+            match self
+                .index_file(name, &scan_result.path, &scan_result.relative_path)
+                .await
+            {
                 Ok(indexed) => {
                     if indexed {
                         stats.files_indexed += 1;
@@ -115,12 +119,12 @@ impl<'a> Indexer<'a> {
     }
 
     /// Index all collections
-    pub fn index_all(&self) -> Result<IndexStats> {
+    pub async fn index_all(&self) -> Result<IndexStats> {
         let mut total_stats = IndexStats::default();
         let start = Instant::now();
 
-        for collection in self.store.list_collections()? {
-            let stats = self.index_collection(&collection.name)?;
+        for collection in self.store.list_collections().await? {
+            let stats = self.index_collection(&collection.name).await?;
             total_stats.files_scanned += stats.files_scanned;
             total_stats.files_indexed += stats.files_indexed;
             total_stats.files_skipped += stats.files_skipped;
@@ -135,17 +139,22 @@ impl<'a> Indexer<'a> {
     /// Index a single file
     ///
     /// Returns true if the file was indexed, false if skipped (unchanged)
-    fn index_file(&self, collection: &str, path: &Path, relative_path: &str) -> Result<bool> {
-        // Read file content
+    async fn index_file(
+        &self,
+        collection: &str,
+        path: &Path,
+        relative_path: &str,
+    ) -> Result<bool> {
+        // Read file content (sync file I/O is fine here)
         let content = std::fs::read(path)?;
 
         // Calculate hash
         let hash = calculate_hash(&content);
 
         // Check if content already exists
-        if self.store.content_exists(&hash)? {
+        if self.store.content_exists(&hash).await? {
             // Check if document exists with same hash
-            if let Ok(doc) = self.store.get_document(collection, relative_path) {
+            if let Ok(doc) = self.store.get_document(collection, relative_path).await {
                 if doc.hash == hash {
                     return Ok(false); // Skip, unchanged
                 }
@@ -157,7 +166,8 @@ impl<'a> Indexer<'a> {
 
         // Store content
         self.store
-            .insert_content(&hash, &content, &parsed.mime_type)?;
+            .insert_content(&hash, &content, &parsed.mime_type)
+            .await?;
 
         // Get file extension
         let file_type = path
@@ -167,14 +177,16 @@ impl<'a> Indexer<'a> {
             .unwrap_or_default();
 
         // Upsert document
-        self.store.upsert_document(
-            collection,
-            relative_path,
-            parsed.title.as_deref(),
-            &hash,
-            &file_type,
-            &parsed.body,
-        )?;
+        self.store
+            .upsert_document(
+                collection,
+                relative_path,
+                parsed.title.as_deref(),
+                &hash,
+                &file_type,
+                &parsed.body,
+            )
+            .await?;
 
         Ok(true)
     }
@@ -213,10 +225,9 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_index_collection() {
+    #[tokio::test]
+    async fn test_index_collection() {
         let dir = tempdir().unwrap();
-        let db_dir = tempdir().unwrap();
 
         // Create test files
         File::create(dir.path().join("test1.md"))
@@ -230,29 +241,29 @@ mod tests {
             .unwrap();
 
         // Create store
-        let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+        let store = Store::open_memory().await.unwrap();
 
         // Add collection
         store
             .add_collection("test", dir.path().to_str().unwrap(), &["**/*.md"])
+            .await
             .unwrap();
 
         // Index
         let indexer = Indexer::new(&store);
-        let stats = indexer.index_collection("test").unwrap();
+        let stats = indexer.index_collection("test").await.unwrap();
 
         assert_eq!(stats.files_scanned, 2);
         assert_eq!(stats.files_indexed, 2);
         assert_eq!(stats.errors, 0);
 
         // Verify documents in database
-        assert_eq!(store.count_documents(Some("test")).unwrap(), 2);
+        assert_eq!(store.count_documents(Some("test")).await.unwrap(), 2);
     }
 
-    #[test]
-    fn test_incremental_index() {
+    #[tokio::test]
+    async fn test_incremental_index() {
         let dir = tempdir().unwrap();
-        let db_dir = tempdir().unwrap();
 
         // Create initial file
         let file_path = dir.path().join("test.md");
@@ -262,19 +273,20 @@ mod tests {
             .unwrap();
 
         // Create store and index
-        let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+        let store = Store::open_memory().await.unwrap();
         store
             .add_collection("test", dir.path().to_str().unwrap(), &["**/*.md"])
+            .await
             .unwrap();
 
         let indexer = Indexer::new(&store);
 
         // First index
-        let stats1 = indexer.index_collection("test").unwrap();
+        let stats1 = indexer.index_collection("test").await.unwrap();
         assert_eq!(stats1.files_indexed, 1);
 
         // Second index (unchanged)
-        let stats2 = indexer.index_collection("test").unwrap();
+        let stats2 = indexer.index_collection("test").await.unwrap();
         assert_eq!(stats2.files_indexed, 0);
         assert_eq!(stats2.files_skipped, 1);
 
@@ -285,7 +297,7 @@ mod tests {
             .unwrap();
 
         // Third index (changed)
-        let stats3 = indexer.index_collection("test").unwrap();
+        let stats3 = indexer.index_collection("test").await.unwrap();
         assert_eq!(stats3.files_indexed, 1);
     }
 

@@ -1,10 +1,10 @@
 //! Database schema for QFS
 
 use crate::error::Result;
-use rusqlite::Connection;
+use libsql::Connection;
 
 /// Current schema version
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// SQL to create the database schema
 const SCHEMA_SQL: &str = r#"
@@ -46,6 +46,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 );
 
 -- Vector embeddings (for optional semantic search)
+-- Using libsql native F32_BLOB for vector storage
 CREATE TABLE IF NOT EXISTS embeddings (
     hash TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
@@ -93,37 +94,50 @@ CREATE INDEX IF NOT EXISTS idx_path_contexts_collection ON path_contexts(collect
 "#;
 
 /// Ensure the database schema is up to date
-pub fn ensure_schema(conn: &Connection) -> Result<()> {
+pub async fn ensure_schema(conn: &Connection) -> Result<()> {
     // Check if schema exists
-    let table_exists: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='index_state'",
-        [],
-        |row| row.get(0),
-    )?;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='index_state'",
+            (),
+        )
+        .await?;
+
+    let table_exists: bool = if let Some(row) = rows.next().await? {
+        row.get::<i64>(0)? > 0
+    } else {
+        false
+    };
 
     if !table_exists {
         // Create initial schema
-        conn.execute_batch(SCHEMA_SQL)?;
+        conn.execute_batch(SCHEMA_SQL).await?;
 
         // Set schema version
         conn.execute(
             "INSERT INTO index_state (key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
-        )?;
+        )
+        .await?;
 
         tracing::info!("Created database schema version {}", SCHEMA_VERSION);
     } else {
         // Check schema version
-        let version: i64 = conn
-            .query_row(
+        let mut rows = conn
+            .query(
                 "SELECT CAST(value AS INTEGER) FROM index_state WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
+                (),
             )
-            .unwrap_or(0);
+            .await?;
+
+        let version: i64 = if let Some(row) = rows.next().await? {
+            row.get(0)?
+        } else {
+            0
+        };
 
         if version < SCHEMA_VERSION {
-            migrate(conn, version)?;
+            migrate(conn, version).await?;
         }
     }
 
@@ -131,7 +145,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 }
 
 /// Migrate from an older schema version
-fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
+async fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
     tracing::info!(
         "Migrating database from version {} to {}",
         from_version,
@@ -139,13 +153,14 @@ fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
     );
 
     // Add migration steps here as schema evolves
-    // For now, we only have version 1
+    // Version 2: libsql migration (schema compatible, just version bump)
 
     // Update schema version
     conn.execute(
         "UPDATE index_state SET value = ?1 WHERE key = 'schema_version'",
         [SCHEMA_VERSION.to_string()],
-    )?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -153,20 +168,27 @@ fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libsql::Builder;
 
-    #[test]
-    fn test_schema_creation() {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn test_schema_creation() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        ensure_schema(&conn).await.unwrap();
 
         // Verify tables exist
-        let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                (),
+            )
+            .await
             .unwrap();
+
+        let mut tables = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            tables.push(row.get::<String>(0).unwrap());
+        }
 
         assert!(tables.contains(&"content".to_string()));
         assert!(tables.contains(&"documents".to_string()));
@@ -175,39 +197,45 @@ mod tests {
         assert!(tables.contains(&"index_state".to_string()));
     }
 
-    #[test]
-    fn test_schema_version() {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn test_schema_version() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        ensure_schema(&conn).await.unwrap();
 
-        let version: i64 = conn
-            .query_row(
+        let mut rows = conn
+            .query(
                 "SELECT CAST(value AS INTEGER) FROM index_state WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
+                (),
             )
+            .await
             .unwrap();
+
+        let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
 
         assert_eq!(version, SCHEMA_VERSION);
     }
 
-    #[test]
-    fn test_idempotent_schema() {
-        let conn = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_idempotent_schema() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
 
         // Call ensure_schema multiple times
-        ensure_schema(&conn).unwrap();
-        ensure_schema(&conn).unwrap();
-        ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).await.unwrap();
+        ensure_schema(&conn).await.unwrap();
+        ensure_schema(&conn).await.unwrap();
 
         // Should still work
-        let version: i64 = conn
-            .query_row(
+        let mut rows = conn
+            .query(
                 "SELECT CAST(value AS INTEGER) FROM index_state WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
+                (),
             )
+            .await
             .unwrap();
+
+        let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
 
         assert_eq!(version, SCHEMA_VERSION);
     }
