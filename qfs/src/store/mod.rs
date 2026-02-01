@@ -10,11 +10,15 @@
 mod schema;
 
 use crate::error::{Error, Result};
-use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
 use chrono::Utc;
+use glob::Pattern;
+use rusqlite::{params, Connection};
+use std::path::{Path, PathBuf};
 
 pub use schema::SCHEMA_VERSION;
+
+/// Default max bytes for multi-get (10KB)
+pub const DEFAULT_MULTI_GET_MAX_BYTES: usize = 10 * 1024;
 
 /// Document metadata stored in the database
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -44,6 +48,17 @@ pub struct Collection {
     pub updated_at: String,
 }
 
+/// Context entry
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PathContext {
+    pub id: i64,
+    pub collection: Option<String>,
+    pub path_prefix: String,
+    pub context: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Row returned from BM25 search query
 #[derive(Debug, Clone)]
 pub struct SearchResultRow {
@@ -67,6 +82,63 @@ pub struct Content {
     pub content_type: String,
     pub size: i64,
     pub created_at: String,
+}
+
+/// Result from multi-get operation
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiGetResult {
+    pub path: String,
+    pub collection: String,
+    pub title: Option<String>,
+    pub content: Option<String>,
+    pub size: i64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+/// File entry for ls output
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileEntry {
+    pub collection: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub size: i64,
+    pub modified_at: String,
+}
+
+/// Extract short docid from a full hash (first 6 characters).
+pub fn get_docid(hash: &str) -> &str {
+    &hash[..6.min(hash.len())]
+}
+
+/// Normalize a docid input by stripping quotes and leading #.
+/// Handles: "#abc123", 'abc123', "abc123", #abc123, abc123
+pub fn normalize_docid(docid: &str) -> String {
+    let mut normalized = docid.trim().to_string();
+
+    // Strip surrounding quotes
+    if (normalized.starts_with('"') && normalized.ends_with('"'))
+        || (normalized.starts_with('\'') && normalized.ends_with('\''))
+    {
+        normalized = normalized[1..normalized.len() - 1].to_string();
+    }
+
+    // Strip leading #
+    if normalized.starts_with('#') {
+        normalized = normalized[1..].to_string();
+    }
+
+    normalized
+}
+
+/// Check if a string looks like a docid reference.
+/// Returns true if normalized form is valid hex of 6+ chars.
+pub fn is_docid(input: &str) -> bool {
+    let normalized = normalize_docid(input);
+    normalized.len() >= 6 && normalized.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// The main database store
@@ -122,12 +194,7 @@ impl Store {
     // -------------------------------------------------------------------------
 
     /// Add a new collection
-    pub fn add_collection(
-        &self,
-        name: &str,
-        path: &str,
-        patterns: &[&str],
-    ) -> Result<()> {
+    pub fn add_collection(&self, name: &str, path: &str, patterns: &[&str]) -> Result<()> {
         self.add_collection_full(name, path, patterns, &[], None, false)
     }
 
@@ -149,7 +216,15 @@ impl Store {
             "INSERT OR REPLACE INTO collections
              (name, path, patterns, exclude, context, embeddings_enabled, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![name, path, patterns_json, exclude_json, context, embeddings_enabled, now],
+            params![
+                name,
+                path,
+                patterns_json,
+                exclude_json,
+                context,
+                embeddings_enabled,
+                now
+            ],
         )?;
 
         Ok(())
@@ -162,21 +237,23 @@ impl Store {
              FROM collections WHERE name = ?1"
         )?;
 
-        let collection = stmt.query_row([name], |row| {
-            let patterns_json: String = row.get(2)?;
-            let exclude_json: String = row.get(3)?;
+        let collection = stmt
+            .query_row([name], |row| {
+                let patterns_json: String = row.get(2)?;
+                let exclude_json: String = row.get(3)?;
 
-            Ok(Collection {
-                name: row.get(0)?,
-                path: row.get(1)?,
-                patterns: serde_json::from_str(&patterns_json).unwrap_or_default(),
-                exclude: serde_json::from_str(&exclude_json).unwrap_or_default(),
-                context: row.get(4)?,
-                embeddings_enabled: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
+                Ok(Collection {
+                    name: row.get(0)?,
+                    path: row.get(1)?,
+                    patterns: serde_json::from_str(&patterns_json).unwrap_or_default(),
+                    exclude: serde_json::from_str(&exclude_json).unwrap_or_default(),
+                    context: row.get(4)?,
+                    embeddings_enabled: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
             })
-        }).map_err(|_| Error::CollectionNotFound(name.to_string()))?;
+            .map_err(|_| Error::CollectionNotFound(name.to_string()))?;
 
         Ok(collection)
     }
@@ -188,21 +265,23 @@ impl Store {
              FROM collections ORDER BY name"
         )?;
 
-        let collections = stmt.query_map([], |row| {
-            let patterns_json: String = row.get(2)?;
-            let exclude_json: String = row.get(3)?;
+        let collections = stmt
+            .query_map([], |row| {
+                let patterns_json: String = row.get(2)?;
+                let exclude_json: String = row.get(3)?;
 
-            Ok(Collection {
-                name: row.get(0)?,
-                path: row.get(1)?,
-                patterns: serde_json::from_str(&patterns_json).unwrap_or_default(),
-                exclude: serde_json::from_str(&exclude_json).unwrap_or_default(),
-                context: row.get(4)?,
-                embeddings_enabled: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(Collection {
+                    name: row.get(0)?,
+                    path: row.get(1)?,
+                    patterns: serde_json::from_str(&patterns_json).unwrap_or_default(),
+                    exclude: serde_json::from_str(&exclude_json).unwrap_or_default(),
+                    context: row.get(4)?,
+                    embeddings_enabled: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(collections)
     }
@@ -210,16 +289,12 @@ impl Store {
     /// Remove a collection and its documents
     pub fn remove_collection(&self, name: &str) -> Result<()> {
         // Delete documents first
-        self.conn.execute(
-            "DELETE FROM documents WHERE collection = ?1",
-            [name],
-        )?;
+        self.conn
+            .execute("DELETE FROM documents WHERE collection = ?1", [name])?;
 
         // Delete the collection
-        self.conn.execute(
-            "DELETE FROM collections WHERE name = ?1",
-            [name],
-        )?;
+        self.conn
+            .execute("DELETE FROM collections WHERE name = ?1", [name])?;
 
         Ok(())
     }
@@ -257,18 +332,20 @@ impl Store {
     /// Get content by hash
     pub fn get_content(&self, hash: &str) -> Result<Content> {
         let mut stmt = self.conn.prepare(
-            "SELECT hash, content, content_type, size, created_at FROM content WHERE hash = ?1"
+            "SELECT hash, content, content_type, size, created_at FROM content WHERE hash = ?1",
         )?;
 
-        let content = stmt.query_row([hash], |row| {
-            Ok(Content {
-                hash: row.get(0)?,
-                data: row.get(1)?,
-                content_type: row.get(2)?,
-                size: row.get(3)?,
-                created_at: row.get(4)?,
+        let content = stmt
+            .query_row([hash], |row| {
+                Ok(Content {
+                    hash: row.get(0)?,
+                    data: row.get(1)?,
+                    content_type: row.get(2)?,
+                    size: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
             })
-        }).map_err(|_| Error::DocumentNotFound(hash.to_string()))?;
+            .map_err(|_| Error::DocumentNotFound(hash.to_string()))?;
 
         Ok(content)
     }
@@ -312,10 +389,8 @@ impl Store {
         )?;
 
         // Update FTS index (FTS5 doesn't support ON CONFLICT, so delete first)
-        self.conn.execute(
-            "DELETE FROM documents_fts WHERE rowid = ?1",
-            [id],
-        )?;
+        self.conn
+            .execute("DELETE FROM documents_fts WHERE rowid = ?1", [id])?;
         self.conn.execute(
             "INSERT INTO documents_fts (rowid, filepath, title, body)
              VALUES (?1, ?2, ?3, ?4)",
@@ -332,20 +407,22 @@ impl Store {
              FROM documents WHERE collection = ?1 AND path = ?2 AND active = 1"
         )?;
 
-        let doc = stmt.query_row([collection, path], |row| {
-            Ok(Document {
-                id: row.get(0)?,
-                collection: row.get(1)?,
-                path: row.get(2)?,
-                title: row.get(3)?,
-                hash: row.get(4)?,
-                file_type: row.get(5)?,
-                created_at: row.get(6)?,
-                modified_at: row.get(7)?,
-                indexed_at: row.get(8)?,
-                active: row.get(9)?,
+        let doc = stmt
+            .query_row([collection, path], |row| {
+                Ok(Document {
+                    id: row.get(0)?,
+                    collection: row.get(1)?,
+                    path: row.get(2)?,
+                    title: row.get(3)?,
+                    hash: row.get(4)?,
+                    file_type: row.get(5)?,
+                    created_at: row.get(6)?,
+                    modified_at: row.get(7)?,
+                    indexed_at: row.get(8)?,
+                    active: row.get(9)?,
+                })
             })
-        }).map_err(|_| Error::DocumentNotFound(format!("{}/{}", collection, path)))?;
+            .map_err(|_| Error::DocumentNotFound(format!("{}/{}", collection, path)))?;
 
         Ok(doc)
     }
@@ -357,20 +434,60 @@ impl Store {
              FROM documents WHERE id = ?1"
         )?;
 
-        let doc = stmt.query_row([id], |row| {
-            Ok(Document {
-                id: row.get(0)?,
-                collection: row.get(1)?,
-                path: row.get(2)?,
-                title: row.get(3)?,
-                hash: row.get(4)?,
-                file_type: row.get(5)?,
-                created_at: row.get(6)?,
-                modified_at: row.get(7)?,
-                indexed_at: row.get(8)?,
-                active: row.get(9)?,
+        let doc = stmt
+            .query_row([id], |row| {
+                Ok(Document {
+                    id: row.get(0)?,
+                    collection: row.get(1)?,
+                    path: row.get(2)?,
+                    title: row.get(3)?,
+                    hash: row.get(4)?,
+                    file_type: row.get(5)?,
+                    created_at: row.get(6)?,
+                    modified_at: row.get(7)?,
+                    indexed_at: row.get(8)?,
+                    active: row.get(9)?,
+                })
             })
-        }).map_err(|_| Error::DocumentNotFound(id.to_string()))?;
+            .map_err(|_| Error::DocumentNotFound(id.to_string()))?;
+
+        Ok(doc)
+    }
+
+    /// Find a document by its short docid (first 6 characters of hash).
+    /// Returns the first matching document if found.
+    pub fn get_document_by_docid(&self, docid: &str) -> Result<Document> {
+        let short_hash = normalize_docid(docid);
+
+        if short_hash.len() < 6 {
+            return Err(Error::InvalidQuery(
+                "Docid must be at least 6 characters".to_string(),
+            ));
+        }
+
+        let pattern = format!("{}%", short_hash);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
+             FROM documents WHERE hash LIKE ?1 AND active = 1 LIMIT 1",
+        )?;
+
+        let doc = stmt
+            .query_row([&pattern], |row| {
+                Ok(Document {
+                    id: row.get(0)?,
+                    collection: row.get(1)?,
+                    path: row.get(2)?,
+                    title: row.get(3)?,
+                    hash: row.get(4)?,
+                    file_type: row.get(5)?,
+                    created_at: row.get(6)?,
+                    modified_at: row.get(7)?,
+                    indexed_at: row.get(8)?,
+                    active: row.get(9)?,
+                })
+            })
+            .map_err(|_| Error::DocumentNotFound(format!("docid:{}", short_hash)))?;
 
         Ok(doc)
     }
@@ -380,10 +497,8 @@ impl Store {
         // First get the document ID to remove from FTS
         if let Ok(doc) = self.get_document(collection, path) {
             // Remove from FTS index
-            self.conn.execute(
-                "DELETE FROM documents_fts WHERE rowid = ?1",
-                [doc.id],
-            )?;
+            self.conn
+                .execute("DELETE FROM documents_fts WHERE rowid = ?1", [doc.id])?;
         }
 
         self.conn.execute(
@@ -439,6 +554,237 @@ impl Store {
             )?
         };
         Ok(count)
+    }
+
+    /// List files in a collection, optionally filtered by path prefix.
+    pub fn list_files(
+        &self,
+        collection: &str,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<FileEntry>> {
+        let sql = if path_prefix.is_some() {
+            r#"
+            SELECT d.collection, d.path, d.title, LENGTH(c.content) as size, d.modified_at
+            FROM documents d
+            JOIN content c ON c.hash = d.hash
+            WHERE d.collection = ?1 AND d.path LIKE ?2 AND d.active = 1
+            ORDER BY d.path
+            "#
+        } else {
+            r#"
+            SELECT d.collection, d.path, d.title, LENGTH(c.content) as size, d.modified_at
+            FROM documents d
+            JOIN content c ON c.hash = d.hash
+            WHERE d.collection = ?1 AND d.active = 1
+            ORDER BY d.path
+            "#
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut entries = Vec::new();
+
+        let mut rows = if let Some(prefix) = path_prefix {
+            let pattern = format!("{}%", prefix);
+            stmt.query(params![collection, pattern])?
+        } else {
+            stmt.query(params![collection])?
+        };
+
+        while let Some(row) = rows.next()? {
+            entries.push(FileEntry {
+                collection: row.get(0)?,
+                path: row.get(1)?,
+                title: row.get(2)?,
+                size: row.get(3)?,
+                modified_at: row.get(4)?,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    // -------------------------------------------------------------------------
+    // Context operations
+    // -------------------------------------------------------------------------
+
+    /// Add or update a context for a path prefix.
+    /// Use collection=None for global context.
+    pub fn set_context(
+        &self,
+        collection: Option<&str>,
+        path_prefix: &str,
+        context: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        // Normalize path prefix to start with /
+        let normalized = if path_prefix.starts_with('/') {
+            path_prefix.to_string()
+        } else {
+            format!("/{}", path_prefix)
+        };
+
+        self.conn.execute(
+            "INSERT INTO path_contexts (collection, path_prefix, context, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(collection, path_prefix) DO UPDATE SET
+               context = excluded.context,
+               updated_at = excluded.updated_at",
+            params![collection, normalized, context, now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get the global context.
+    pub fn get_global_context(&self) -> Result<Option<String>> {
+        let result: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT context FROM path_contexts WHERE collection IS NULL AND path_prefix = '/'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+
+        Ok(result)
+    }
+
+    /// Find the most specific context for a file path.
+    /// Uses longest-prefix matching.
+    pub fn find_context_for_path(
+        &self,
+        collection: &str,
+        file_path: &str,
+    ) -> Result<Option<String>> {
+        // Normalize file path
+        let normalized = if file_path.starts_with('/') {
+            file_path.to_string()
+        } else {
+            format!("/{}", file_path)
+        };
+
+        // Get all matching contexts for this collection (sorted by prefix length desc)
+        let mut stmt = self.conn.prepare(
+            "SELECT path_prefix, context FROM path_contexts
+             WHERE (collection = ?1 OR collection IS NULL)
+             ORDER BY
+               CASE WHEN collection IS NOT NULL THEN 0 ELSE 1 END,
+               LENGTH(path_prefix) DESC",
+        )?;
+
+        let mut rows = stmt.query([collection])?;
+
+        while let Some(row) = rows.next()? {
+            let prefix: String = row.get(0)?;
+            let context: String = row.get(1)?;
+
+            // Check if file path starts with this prefix
+            if normalized.starts_with(&prefix) || normalized == prefix.trim_end_matches('/') {
+                return Ok(Some(context));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Get all contexts for a file path (global + collection, ordered general to specific).
+    /// Used for search results where we want all relevant context.
+    pub fn get_all_contexts_for_path(
+        &self,
+        collection: &str,
+        file_path: &str,
+    ) -> Result<Vec<String>> {
+        let normalized = if file_path.starts_with('/') {
+            file_path.to_string()
+        } else {
+            format!("/{}", file_path)
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT path_prefix, context, collection FROM path_contexts
+             WHERE (collection = ?1 OR collection IS NULL)
+             ORDER BY
+               CASE WHEN collection IS NULL THEN 0 ELSE 1 END,
+               LENGTH(path_prefix) ASC",
+        )?;
+
+        let mut contexts = Vec::new();
+        let mut rows = stmt.query([collection])?;
+
+        while let Some(row) = rows.next()? {
+            let prefix: String = row.get(0)?;
+            let context: String = row.get(1)?;
+
+            if normalized.starts_with(&prefix) || prefix == "/" {
+                contexts.push(context);
+            }
+        }
+
+        Ok(contexts)
+    }
+
+    /// List all contexts.
+    pub fn list_contexts(&self) -> Result<Vec<PathContext>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, collection, path_prefix, context, created_at, updated_at
+             FROM path_contexts
+             ORDER BY
+               CASE WHEN collection IS NULL THEN '' ELSE collection END,
+               path_prefix",
+        )?;
+
+        let mut contexts = Vec::new();
+        let mut rows = stmt.query([])?;
+
+        while let Some(row) = rows.next()? {
+            contexts.push(PathContext {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                path_prefix: row.get(2)?,
+                context: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            });
+        }
+
+        Ok(contexts)
+    }
+
+    /// Remove a context.
+    pub fn remove_context(&self, collection: Option<&str>, path_prefix: &str) -> Result<bool> {
+        let normalized = if path_prefix.starts_with('/') {
+            path_prefix.to_string()
+        } else {
+            format!("/{}", path_prefix)
+        };
+
+        let rows = self.conn.execute(
+            "DELETE FROM path_contexts WHERE collection IS ?1 AND path_prefix = ?2",
+            params![collection, normalized],
+        )?;
+
+        Ok(rows > 0)
+    }
+
+    /// Get collections without any context defined.
+    pub fn get_collections_without_context(&self) -> Result<Vec<Collection>> {
+        let all_collections = self.list_collections()?;
+
+        let mut without_context = Vec::new();
+        for coll in all_collections {
+            let has_context: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM path_contexts WHERE collection = ?1",
+                [&coll.name],
+                |row| row.get(0),
+            )?;
+
+            if has_context == 0 {
+                without_context.push(coll);
+            }
+        }
+
+        Ok(without_context)
     }
 
     // -------------------------------------------------------------------------
@@ -585,7 +931,7 @@ impl Store {
     pub fn get_embeddings(&self, hash: &str) -> Result<Vec<EmbeddingRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT hash, chunk_index, char_offset, model, embedding, created_at
-             FROM embeddings WHERE hash = ?1 ORDER BY chunk_index"
+             FROM embeddings WHERE hash = ?1 ORDER BY chunk_index",
         )?;
 
         let mut results = Vec::new();
@@ -617,10 +963,8 @@ impl Store {
 
     /// Delete embeddings for a document hash
     pub fn delete_embeddings(&self, hash: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM embeddings WHERE hash = ?1",
-            [hash],
-        )?;
+        self.conn
+            .execute("DELETE FROM embeddings WHERE hash = ?1", [hash])?;
         Ok(())
     }
 
@@ -636,11 +980,10 @@ impl Store {
                 |row| row.get(0),
             )?
         } else {
-            self.conn.query_row(
-                "SELECT COUNT(DISTINCT hash) FROM embeddings",
-                [],
-                |row| row.get(0),
-            )?
+            self.conn
+                .query_row("SELECT COUNT(DISTINCT hash) FROM embeddings", [], |row| {
+                    row.get(0)
+                })?
         };
         Ok(count)
     }
@@ -712,6 +1055,177 @@ impl Store {
 
         Ok(results)
     }
+
+    // -------------------------------------------------------------------------
+    // Multi-get operations
+    // -------------------------------------------------------------------------
+
+    /// Match files by glob pattern.
+    /// Returns files matching the pattern with their sizes (before loading content).
+    pub fn match_files_by_glob(&self, pattern: &str) -> Result<Vec<(String, String, i64)>> {
+        let glob = Pattern::new(pattern)
+            .map_err(|e| Error::InvalidQuery(format!("Invalid glob pattern: {}", e)))?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT d.collection, d.path, LENGTH(c.content) as size
+             FROM documents d
+             JOIN content c ON c.hash = d.hash
+             WHERE d.active = 1",
+        )?;
+
+        let mut matches = Vec::new();
+        let mut rows = stmt.query([])?;
+
+        while let Some(row) = rows.next()? {
+            let collection: String = row.get(0)?;
+            let path: String = row.get(1)?;
+            let size: i64 = row.get(2)?;
+
+            let full_path = format!("{}/{}", collection, path);
+            let virtual_path = format!("qfs://{}/{}", collection, path);
+
+            // Match against both formats
+            if glob.matches(&full_path) || glob.matches(&path) || glob.matches(&virtual_path) {
+                matches.push((collection, path, size));
+            }
+        }
+
+        Ok(matches)
+    }
+
+    /// Parse comma-separated list of paths.
+    /// Returns list of (collection, path, size) tuples found.
+    pub fn parse_comma_list(&self, input: &str) -> Result<Vec<(String, String, i64)>> {
+        let names: Vec<&str> = input
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut results = Vec::new();
+
+        for name in names {
+            // Try exact match first (collection/path format)
+            if let Some((coll, path)) = name.split_once('/') {
+                if let Ok(doc) = self.get_document(coll, path) {
+                    let content = self.get_content(&doc.hash)?;
+                    results.push((doc.collection, doc.path, content.size));
+                    continue;
+                }
+            }
+
+            // Try suffix match
+            let mut stmt = self.conn.prepare(
+                "SELECT d.collection, d.path, LENGTH(c.content) as size
+                 FROM documents d
+                 JOIN content c ON c.hash = d.hash
+                 WHERE d.path LIKE ?1 AND d.active = 1
+                 LIMIT 1",
+            )?;
+
+            let pattern = format!("%{}", name);
+            if let Ok(row) = stmt.query_row([&pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            }) {
+                results.push(row);
+            }
+            // Note: silently skip if not found (could add error collection)
+        }
+
+        Ok(results)
+    }
+
+    /// Get multiple documents with size filtering.
+    pub fn multi_get(
+        &self,
+        pattern: &str,
+        max_bytes: usize,
+        max_lines: Option<usize>,
+    ) -> Result<Vec<MultiGetResult>> {
+        // Detect pattern type
+        let is_glob = pattern.contains('*') || pattern.contains('?');
+        let is_comma_list = pattern.contains(',') && !is_glob;
+
+        let files = if is_glob {
+            self.match_files_by_glob(pattern)?
+        } else if is_comma_list {
+            self.parse_comma_list(pattern)?
+        } else {
+            // Single file
+            let parts: Vec<&str> = pattern.splitn(2, '/').collect();
+            if parts.len() == 2 {
+                if let Ok(doc) = self.get_document(parts[0], parts[1]) {
+                    let content = self.get_content(&doc.hash)?;
+                    vec![(doc.collection, doc.path, content.size)]
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        };
+
+        let mut results = Vec::new();
+
+        for (collection, path, size) in files {
+            let full_path = format!("{}/{}", collection, path);
+
+            // Check size limit
+            if size as usize > max_bytes {
+                results.push(MultiGetResult {
+                    path: full_path,
+                    collection,
+                    title: None,
+                    content: None,
+                    size,
+                    skipped: true,
+                    skip_reason: Some(format!(
+                        "File too large ({}KB > {}KB). Use 'qfs get' to retrieve.",
+                        size / 1024,
+                        max_bytes / 1024
+                    )),
+                });
+                continue;
+            }
+
+            // Get document and content
+            if let Ok(doc) = self.get_document(&collection, &path) {
+                if let Ok(content) = self.get_content(&doc.hash) {
+                    let mut text = String::from_utf8(content.data.clone())
+                        .unwrap_or_else(|_| "[Binary content]".to_string());
+
+                    // Apply line limit if specified
+                    if let Some(limit) = max_lines {
+                        let lines: Vec<&str> = text.lines().take(limit).collect();
+                        let original_count = text.lines().count();
+                        text = lines.join("\n");
+                        if original_count > limit {
+                            text.push_str(&format!(
+                                "\n\n[... truncated {} more lines]",
+                                original_count - limit
+                            ));
+                        }
+                    }
+
+                    results.push(MultiGetResult {
+                        path: full_path,
+                        collection: doc.collection,
+                        title: doc.title,
+                        content: Some(text),
+                        size,
+                        skipped: false,
+                        skip_reason: None,
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 /// Row from embeddings table
@@ -754,7 +1268,9 @@ mod tests {
         let store = Store::open_memory().unwrap();
 
         // Add collection
-        store.add_collection("test", "/tmp/test", &["**/*.md"]).unwrap();
+        store
+            .add_collection("test", "/tmp/test", &["**/*.md"])
+            .unwrap();
 
         // Get collection
         let coll = store.get_collection("test").unwrap();
@@ -797,20 +1313,26 @@ mod tests {
         let store = Store::open_memory().unwrap();
 
         // Add collection first
-        store.add_collection("test", "/tmp/test", &["**/*.md"]).unwrap();
+        store
+            .add_collection("test", "/tmp/test", &["**/*.md"])
+            .unwrap();
 
         // Insert content
-        store.insert_content("hash123", b"# Hello\n\nWorld", "text/markdown").unwrap();
+        store
+            .insert_content("hash123", b"# Hello\n\nWorld", "text/markdown")
+            .unwrap();
 
         // Upsert document
-        let id = store.upsert_document(
-            "test",
-            "hello.md",
-            Some("Hello"),
-            "hash123",
-            ".md",
-            "Hello World",
-        ).unwrap();
+        let id = store
+            .upsert_document(
+                "test",
+                "hello.md",
+                Some("Hello"),
+                "hash123",
+                ".md",
+                "Hello World",
+            )
+            .unwrap();
 
         assert!(id > 0);
 
@@ -833,16 +1355,63 @@ mod tests {
         let store = Store::open_memory().unwrap();
 
         // Add collection
-        store.add_collection("test", "/tmp/test", &["**/*.md"]).unwrap();
+        store
+            .add_collection("test", "/tmp/test", &["**/*.md"])
+            .unwrap();
 
         // Insert content and documents
-        store.insert_content("hash1", b"# Rust Programming\n\nRust is a systems programming language.", "text/markdown").unwrap();
-        store.insert_content("hash2", b"# Python Tutorial\n\nPython is a dynamic language.", "text/markdown").unwrap();
-        store.insert_content("hash3", b"# JavaScript Guide\n\nJavaScript runs in browsers.", "text/markdown").unwrap();
+        store
+            .insert_content(
+                "hash1",
+                b"# Rust Programming\n\nRust is a systems programming language.",
+                "text/markdown",
+            )
+            .unwrap();
+        store
+            .insert_content(
+                "hash2",
+                b"# Python Tutorial\n\nPython is a dynamic language.",
+                "text/markdown",
+            )
+            .unwrap();
+        store
+            .insert_content(
+                "hash3",
+                b"# JavaScript Guide\n\nJavaScript runs in browsers.",
+                "text/markdown",
+            )
+            .unwrap();
 
-        store.upsert_document("test", "rust.md", Some("Rust Programming"), "hash1", ".md", "Rust Programming Rust is a systems programming language").unwrap();
-        store.upsert_document("test", "python.md", Some("Python Tutorial"), "hash2", ".md", "Python Tutorial Python is a dynamic language").unwrap();
-        store.upsert_document("test", "javascript.md", Some("JavaScript Guide"), "hash3", ".md", "JavaScript Guide JavaScript runs in browsers").unwrap();
+        store
+            .upsert_document(
+                "test",
+                "rust.md",
+                Some("Rust Programming"),
+                "hash1",
+                ".md",
+                "Rust Programming Rust is a systems programming language",
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                "test",
+                "python.md",
+                Some("Python Tutorial"),
+                "hash2",
+                ".md",
+                "Python Tutorial Python is a dynamic language",
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                "test",
+                "javascript.md",
+                Some("JavaScript Guide"),
+                "hash3",
+                ".md",
+                "JavaScript Guide JavaScript runs in browsers",
+            )
+            .unwrap();
 
         // Search for "rust"
         let results = store.search_bm25("\"rust\"*", None, 10, false).unwrap();
@@ -850,7 +1419,9 @@ mod tests {
         assert_eq!(results[0].path, "rust.md");
 
         // Search for "programming"
-        let results = store.search_bm25("\"programming\"*", None, 10, false).unwrap();
+        let results = store
+            .search_bm25("\"programming\"*", None, 10, false)
+            .unwrap();
         assert!(!results.is_empty(), "Should find results for 'programming'");
 
         // Search for "language"
@@ -858,10 +1429,313 @@ mod tests {
         assert_eq!(results.len(), 2, "Should find 2 results for 'language'");
 
         // Search with collection filter
-        let results = store.search_bm25("\"rust\"*", Some("test"), 10, false).unwrap();
+        let results = store
+            .search_bm25("\"rust\"*", Some("test"), 10, false)
+            .unwrap();
         assert!(!results.is_empty());
 
-        let results = store.search_bm25("\"rust\"*", Some("nonexistent"), 10, false).unwrap();
+        let results = store
+            .search_bm25("\"rust\"*", Some("nonexistent"), 10, false)
+            .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_docid() {
+        let hash = "abc123def456789012345678901234567890123456789012345678901234";
+        assert_eq!(get_docid(hash), "abc123");
+    }
+
+    #[test]
+    fn test_normalize_docid_with_hash() {
+        assert_eq!(normalize_docid("#abc123"), "abc123");
+    }
+
+    #[test]
+    fn test_normalize_docid_bare() {
+        assert_eq!(normalize_docid("abc123"), "abc123");
+    }
+
+    #[test]
+    fn test_normalize_docid_quoted() {
+        assert_eq!(normalize_docid("\"#abc123\""), "abc123");
+        assert_eq!(normalize_docid("'abc123'"), "abc123");
+    }
+
+    #[test]
+    fn test_normalize_docid_whitespace() {
+        assert_eq!(normalize_docid("  #abc123  "), "abc123");
+    }
+
+    #[test]
+    fn test_is_docid_valid() {
+        assert!(is_docid("#abc123"));
+        assert!(is_docid("abc123"));
+        assert!(is_docid("ABC123")); // Case insensitive
+        assert!(is_docid("abc123def456")); // Longer is ok
+    }
+
+    #[test]
+    fn test_is_docid_invalid() {
+        assert!(!is_docid("abc12")); // Too short
+        assert!(!is_docid("ghijkl")); // Non-hex
+        assert!(!is_docid("abc123.md")); // Has extension
+        assert!(!is_docid("qfs://collection/path")); // Virtual path
+    }
+
+    #[test]
+    fn test_get_document_by_docid() {
+        let store = Store::open_memory().unwrap();
+        store
+            .add_collection("test", "/tmp/test", &["**/*.md"])
+            .unwrap();
+        store
+            .insert_content("abc123def456", b"Test content", "text/plain")
+            .unwrap();
+        store
+            .upsert_document(
+                "test",
+                "file.md",
+                Some("Title"),
+                "abc123def456",
+                ".md",
+                "Test",
+            )
+            .unwrap();
+
+        let doc = store.get_document_by_docid("#abc123").unwrap();
+        assert_eq!(doc.path, "file.md");
+
+        let doc = store.get_document_by_docid("abc123").unwrap();
+        assert_eq!(doc.path, "file.md");
+    }
+
+    #[test]
+    fn test_list_files() {
+        let store = Store::open_memory().unwrap();
+        store
+            .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .unwrap();
+        store
+            .insert_content("hash1", b"content1", "text/plain")
+            .unwrap();
+        store
+            .insert_content("hash2", b"content2", "text/plain")
+            .unwrap();
+
+        store
+            .upsert_document("docs", "readme.md", None, "hash1", ".md", "content")
+            .unwrap();
+        store
+            .upsert_document("docs", "guide/intro.md", None, "hash2", ".md", "content")
+            .unwrap();
+
+        // List all
+        let files = store.list_files("docs", None).unwrap();
+        assert_eq!(files.len(), 2);
+
+        // List with prefix
+        let files = store.list_files("docs", Some("guide")).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.starts_with("guide"));
+    }
+
+    fn setup_multi_get_test_store() -> Store {
+        let store = Store::open_memory().unwrap();
+        store
+            .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .unwrap();
+
+        // Add test documents
+        store
+            .insert_content("hash1", b"# Doc 1\nSmall file", "text/markdown")
+            .unwrap();
+        store
+            .insert_content("hash2", b"# Doc 2\nAnother small file", "text/markdown")
+            .unwrap();
+        store
+            .insert_content("hash3", &vec![b'x'; 20000], "text/plain")
+            .unwrap(); // Large file
+
+        store
+            .upsert_document("docs", "readme.md", Some("Readme"), "hash1", ".md", "Doc 1")
+            .unwrap();
+        store
+            .upsert_document("docs", "guide.md", Some("Guide"), "hash2", ".md", "Doc 2")
+            .unwrap();
+        store
+            .upsert_document("docs", "large.txt", Some("Large"), "hash3", ".txt", "Large")
+            .unwrap();
+
+        store
+    }
+
+    #[test]
+    fn test_multi_get_glob_pattern() {
+        let store = setup_multi_get_test_store();
+        let results = store.multi_get("docs/**/*.md", 10240, None).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.path.ends_with(".md")));
+        assert!(results.iter().all(|r| !r.skipped));
+    }
+
+    #[test]
+    fn test_multi_get_comma_list() {
+        let store = setup_multi_get_test_store();
+        let results = store
+            .multi_get("docs/readme.md, docs/guide.md", 10240, None)
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|r| r.path == "docs/readme.md"));
+        assert!(results.iter().any(|r| r.path == "docs/guide.md"));
+    }
+
+    #[test]
+    fn test_multi_get_max_bytes_skip() {
+        let store = setup_multi_get_test_store();
+        let results = store.multi_get("docs/**/*", 10240, None).unwrap();
+
+        let large = results.iter().find(|r| r.path.contains("large")).unwrap();
+        assert!(large.skipped);
+        assert!(large.skip_reason.is_some());
+        assert!(large.content.is_none());
+    }
+
+    #[test]
+    fn test_multi_get_max_lines_truncation() {
+        let store = setup_multi_get_test_store();
+        let results = store.multi_get("docs/readme.md", 10240, Some(1)).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let content = results[0].content.as_ref().unwrap();
+        assert!(content.contains("[... truncated"));
+    }
+
+    #[test]
+    fn test_multi_get_no_matches() {
+        let store = setup_multi_get_test_store();
+        let results = store
+            .multi_get("nonexistent/**/*.xyz", 10240, None)
+            .unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_set_and_get_global_context() {
+        let store = Store::open_memory().unwrap();
+        store.set_context(None, "/", "Global context").unwrap();
+
+        let ctx = store.get_global_context().unwrap();
+        assert_eq!(ctx, Some("Global context".to_string()));
+    }
+
+    #[test]
+    fn test_set_and_find_collection_context() {
+        let store = Store::open_memory().unwrap();
+        store
+            .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .unwrap();
+
+        store
+            .set_context(Some("docs"), "/", "Documentation")
+            .unwrap();
+        store
+            .set_context(Some("docs"), "/api", "API reference")
+            .unwrap();
+        store
+            .set_context(Some("docs"), "/api/v2", "API v2 docs")
+            .unwrap();
+
+        // Most specific match wins
+        let ctx = store
+            .find_context_for_path("docs", "/api/v2/endpoints.md")
+            .unwrap();
+        assert_eq!(ctx, Some("API v2 docs".to_string()));
+
+        let ctx = store
+            .find_context_for_path("docs", "/api/v1/old.md")
+            .unwrap();
+        assert_eq!(ctx, Some("API reference".to_string()));
+
+        let ctx = store.find_context_for_path("docs", "/readme.md").unwrap();
+        assert_eq!(ctx, Some("Documentation".to_string()));
+    }
+
+    #[test]
+    fn test_fallback_to_global() {
+        let store = Store::open_memory().unwrap();
+        store
+            .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .unwrap();
+
+        store.set_context(None, "/", "Global fallback").unwrap();
+
+        let ctx = store.find_context_for_path("docs", "/any/path.md").unwrap();
+        assert_eq!(ctx, Some("Global fallback".to_string()));
+    }
+
+    #[test]
+    fn test_get_all_contexts() {
+        let store = Store::open_memory().unwrap();
+        store
+            .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .unwrap();
+
+        store.set_context(None, "/", "Global").unwrap();
+        store.set_context(Some("docs"), "/", "Docs").unwrap();
+        store.set_context(Some("docs"), "/api", "API").unwrap();
+
+        let contexts = store
+            .get_all_contexts_for_path("docs", "/api/file.md")
+            .unwrap();
+        assert_eq!(contexts, vec!["Global", "Docs", "API"]);
+    }
+
+    #[test]
+    fn test_remove_context() {
+        let store = Store::open_memory().unwrap();
+        store
+            .set_context(Some("docs"), "/api", "API context")
+            .unwrap();
+
+        assert!(store.remove_context(Some("docs"), "/api").unwrap());
+        assert!(!store.remove_context(Some("docs"), "/api").unwrap()); // Already removed
+    }
+
+    #[test]
+    fn test_list_contexts() {
+        let store = Store::open_memory().unwrap();
+        store.set_context(None, "/", "Global").unwrap();
+        store.set_context(Some("docs"), "/", "Docs").unwrap();
+        store.set_context(Some("docs"), "/api", "API").unwrap();
+
+        let contexts = store.list_contexts().unwrap();
+        assert_eq!(contexts.len(), 3);
+
+        // First should be global
+        assert_eq!(contexts[0].collection, None);
+        assert_eq!(contexts[0].path_prefix, "/");
+        assert_eq!(contexts[0].context, "Global");
+    }
+
+    #[test]
+    fn test_get_collections_without_context() {
+        let store = Store::open_memory().unwrap();
+        store
+            .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .unwrap();
+        store
+            .add_collection("code", "/tmp/code", &["**/*.rs"])
+            .unwrap();
+
+        // Add context only to docs
+        store.set_context(Some("docs"), "/", "Docs").unwrap();
+
+        let without = store.get_collections_without_context().unwrap();
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].name, "code");
     }
 }

@@ -16,8 +16,14 @@ fn create_test_server_with_docs() -> (Store, tempfile::TempDir, tempfile::TempDi
 
     // Create test documents
     let fixtures = [
-        ("rust_guide.md", "# Rust Programming\n\nRust is a systems language."),
-        ("python_basics.md", "# Python Basics\n\nPython is interpreted."),
+        (
+            "rust_guide.md",
+            "# Rust Programming\n\nRust is a systems language.",
+        ),
+        (
+            "python_basics.md",
+            "# Python Basics\n\nPython is interpreted.",
+        ),
     ];
 
     for (name, content) in fixtures {
@@ -29,11 +35,7 @@ fn create_test_server_with_docs() -> (Store, tempfile::TempDir, tempfile::TempDi
     // Create store and index
     let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
     store
-        .add_collection(
-            "docs",
-            content_dir.path().to_str().unwrap(),
-            &["**/*.md"],
-        )
+        .add_collection("docs", content_dir.path().to_str().unwrap(), &["**/*.md"])
         .unwrap();
 
     let indexer = Indexer::new(&store);
@@ -46,8 +48,7 @@ fn create_test_server_with_docs() -> (Store, tempfile::TempDir, tempfile::TempDi
 fn test_mcp_server_creation() {
     let store = Store::open_memory().unwrap();
     let _server = McpServer::with_store(store);
-    // Server creation should succeed
-    assert!(true);
+    // Server creation should succeed (no panic)
 }
 
 #[test]
@@ -69,7 +70,9 @@ fn test_mcp_tools_list() {
 #[test]
 fn test_mcp_search_tool_empty_results() {
     let store = Store::open_memory().unwrap();
-    store.add_collection("test", "/tmp/test", &["**/*.md"]).unwrap();
+    store
+        .add_collection("test", "/tmp/test", &["**/*.md"])
+        .unwrap();
 
     // Test search with empty results
     let result = qfs::mcp::tools::handle_tool_call(
@@ -110,13 +113,11 @@ fn test_mcp_search_with_results() {
 #[test]
 fn test_mcp_status_tool() {
     let store = Store::open_memory().unwrap();
-    store.add_collection("test", "/tmp/test", &["**/*.md"]).unwrap();
+    store
+        .add_collection("test", "/tmp/test", &["**/*.md"])
+        .unwrap();
 
-    let result = qfs::mcp::tools::handle_tool_call(
-        &store,
-        "qfs_status",
-        &json!({}),
-    );
+    let result = qfs::mcp::tools::handle_tool_call(&store, "qfs_status", &json!({}));
 
     assert!(result.is_ok());
     let tool_result = result.unwrap();
@@ -135,15 +136,12 @@ fn test_mcp_get_tool() {
     // Create a test file
     let file_path = content_dir.path().join("test.md");
     let mut file = File::create(&file_path).unwrap();
-    file.write_all(b"# Test Document\n\nSome content here.").unwrap();
+    file.write_all(b"# Test Document\n\nSome content here.")
+        .unwrap();
 
     let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
     store
-        .add_collection(
-            "docs",
-            content_dir.path().to_str().unwrap(),
-            &["**/*.md"],
-        )
+        .add_collection("docs", content_dir.path().to_str().unwrap(), &["**/*.md"])
         .unwrap();
 
     let indexer = Indexer::new(&store);
@@ -200,23 +198,19 @@ fn test_mcp_multi_get_tool() {
 
     let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
     store
-        .add_collection(
-            "docs",
-            content_dir.path().to_str().unwrap(),
-            &["**/*.md"],
-        )
+        .add_collection("docs", content_dir.path().to_str().unwrap(), &["**/*.md"])
         .unwrap();
 
     let indexer = Indexer::new(&store);
     indexer.index_collection("docs").unwrap();
 
-    // Test multi_get tool
+    // Test multi_get tool with comma-separated pattern
     let result = qfs::mcp::tools::handle_tool_call(
         &store,
         "qfs_multi_get",
         &json!({
-            "paths": ["docs/doc1.md", "docs/doc2.md"],
-            "include_content": true
+            "pattern": "docs/doc1.md, docs/doc2.md",
+            "max_bytes": 10240
         }),
     );
 
@@ -232,7 +226,9 @@ fn test_mcp_multi_get_tool() {
 #[test]
 fn test_mcp_query_tool_with_mode() {
     let store = Store::open_memory().unwrap();
-    store.add_collection("test", "/tmp/test", &["**/*.md"]).unwrap();
+    store
+        .add_collection("test", "/tmp/test", &["**/*.md"])
+        .unwrap();
 
     // Test query with bm25 mode
     let result = qfs::mcp::tools::handle_tool_call(
@@ -252,11 +248,7 @@ fn test_mcp_query_tool_with_mode() {
 fn test_mcp_unknown_tool() {
     let store = Store::open_memory().unwrap();
 
-    let result = qfs::mcp::tools::handle_tool_call(
-        &store,
-        "unknown_tool",
-        &json!({}),
-    );
+    let result = qfs::mcp::tools::handle_tool_call(&store, "unknown_tool", &json!({}));
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -302,7 +294,9 @@ fn test_mcp_protocol_types() {
 #[test]
 fn test_mcp_vsearch_requires_embeddings() {
     let store = Store::open_memory().unwrap();
-    store.add_collection("test", "/tmp/test", &["**/*.md"]).unwrap();
+    store
+        .add_collection("test", "/tmp/test", &["**/*.md"])
+        .unwrap();
 
     // Vector search should fail without embeddings
     let result = qfs::mcp::tools::handle_tool_call(
@@ -349,12 +343,15 @@ fn test_mcp_tool_definitions_schema() {
 
     for tool in &tools {
         // Each tool should have a valid input schema
-        assert!(tool.input_schema.is_object(), "{} should have object schema", tool.name);
+        assert!(
+            tool.input_schema.is_object(),
+            "{} should have object schema",
+            tool.name
+        );
 
         // Schema should have "type": "object"
         assert_eq!(
-            tool.input_schema["type"],
-            "object",
+            tool.input_schema["type"], "object",
             "{} schema should have type object",
             tool.name
         );

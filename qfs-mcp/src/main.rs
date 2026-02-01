@@ -49,7 +49,11 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// QFS MCP Server - Expose file search to AI agents via Model Context Protocol
 #[derive(Parser, Debug)]
 #[command(name = "qfs-mcp")]
-#[command(author, version, about = "QFS MCP Server - Model Context Protocol interface for file search")]
+#[command(
+    author,
+    version,
+    about = "QFS MCP Server - Model Context Protocol interface for file search"
+)]
 struct Args {
     /// Path to the QFS database file
     #[arg(long, short = 'd', env = "QFS_DB_PATH")]
@@ -84,7 +88,10 @@ fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    tracing::info!("Starting QFS MCP server with database: {}", db_path.display());
+    tracing::info!(
+        "Starting QFS MCP server with database: {}",
+        db_path.display()
+    );
 
     // Create and run the MCP server
     let server = McpServer::new(&db_path)?;

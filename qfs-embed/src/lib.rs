@@ -59,7 +59,7 @@ pub enum Model {
 
 impl Model {
     /// Get the fastembed model enum
-    fn to_fastembed(&self) -> EmbeddingModel {
+    fn to_fastembed(self) -> EmbeddingModel {
         match self {
             Model::AllMiniLmL6V2 => EmbeddingModel::AllMiniLML6V2,
             Model::BgeSmallEnV1_5 => EmbeddingModel::BGESmallENV15,
@@ -255,10 +255,7 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<TextChun
 
 /// Serialize embedding to bytes for SQLite storage
 pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
-    embedding
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect()
+    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
 /// Deserialize embedding from bytes
@@ -391,7 +388,7 @@ mod tests {
         // Embeddings should be different for different texts
         let sim = cosine_similarity(&embeddings[0], &embeddings[1]);
         assert!(sim < 0.99); // Not identical
-        assert!(sim > 0.0);  // But still somewhat similar (both English)
+        assert!(sim > 0.0); // But still somewhat similar (both English)
     }
 
     #[test]

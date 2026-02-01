@@ -77,20 +77,20 @@ fn parse_markdown(text: &str, path: &Path) -> Result<ParsedDocument> {
 
                 // Parse frontmatter as YAML
                 let frontmatter_text = frontmatter_lines.join("\n");
-                if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&frontmatter_text) {
-                    if let serde_yaml::Value::Mapping(map) = yaml {
-                        for (k, v) in map {
-                            if let serde_yaml::Value::String(key) = k {
-                                // Extract title from frontmatter
-                                if key == "title" {
-                                    if let serde_yaml::Value::String(t) = &v {
-                                        title = Some(t.clone());
-                                    }
+                if let Ok(serde_yaml::Value::Mapping(map)) =
+                    serde_yaml::from_str::<serde_yaml::Value>(&frontmatter_text)
+                {
+                    for (k, v) in map {
+                        if let serde_yaml::Value::String(key) = k {
+                            // Extract title from frontmatter
+                            if key == "title" {
+                                if let serde_yaml::Value::String(t) = &v {
+                                    title = Some(t.clone());
                                 }
-                                // Convert YAML value to JSON
-                                if let Ok(json_val) = serde_json::to_value(&v) {
-                                    metadata.insert(key, json_val);
-                                }
+                            }
+                            // Convert YAML value to JSON
+                            if let Ok(json_val) = serde_json::to_value(&v) {
+                                metadata.insert(key, json_val);
                             }
                         }
                     }

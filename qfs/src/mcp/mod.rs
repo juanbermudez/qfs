@@ -22,9 +22,9 @@
 //! server.run().unwrap();
 //! ```
 
-mod server;
 mod protocol;
+mod server;
 pub mod tools;
 
+pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, ToolDefinition, ToolResult};
 pub use server::McpServer;
-pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, ToolResult, ToolDefinition};

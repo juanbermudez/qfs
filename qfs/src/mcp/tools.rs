@@ -2,9 +2,9 @@
 //!
 //! Each tool handler processes a specific tool call and returns results.
 
+use super::protocol::{JsonRpcError, ToolDefinition, ToolResult};
 use crate::search::{SearchMode, SearchOptions, Searcher};
 use crate::store::Store;
-use super::protocol::{JsonRpcError, ToolDefinition, ToolResult};
 use serde_json::{json, Value};
 
 /// Get all tool definitions
@@ -87,13 +87,26 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "qfs_get".to_string(),
-            description: "Get a specific document by its path. Returns document metadata and optionally content.".to_string(),
+            description: "Get a specific document by its path or docid. Supports line range extraction.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Document path in format 'collection/relative_path'"
+                        "description": "Document path (collection/relative_path), docid (#abc123), or path:linenum"
+                    },
+                    "from_line": {
+                        "type": "integer",
+                        "description": "Start from this line number (1-indexed)"
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to return"
+                    },
+                    "line_numbers": {
+                        "type": "boolean",
+                        "description": "Add line numbers to output (format: 'N: content')",
+                        "default": false
                     },
                     "include_content": {
                         "type": "boolean",
@@ -106,22 +119,25 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "qfs_multi_get".to_string(),
-            description: "Get multiple documents by their paths. Returns array of documents with metadata and content.".to_string(),
+            description: "Get multiple documents by glob pattern or comma-separated list. Skips files larger than maxBytes.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Array of document paths in format 'collection/relative_path'"
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern (e.g., 'docs/**/*.md') or comma-separated paths"
                     },
-                    "include_content": {
-                        "type": "boolean",
-                        "description": "Whether to include file content (default: true)",
-                        "default": true
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Skip files larger than this (default: 10240 = 10KB)",
+                        "default": 10240
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum lines per file"
                     }
                 },
-                "required": ["paths"]
+                "required": ["pattern"]
             }),
         },
         ToolDefinition {
@@ -157,21 +173,14 @@ pub fn handle_tool_call(
 }
 
 /// Execute search tool (qfs_search or qfs_vsearch)
-fn tool_search(
-    store: &Store,
-    args: &Value,
-    mode: SearchMode,
-) -> Result<ToolResult, JsonRpcError> {
+fn tool_search(store: &Store, args: &Value, mode: SearchMode) -> Result<ToolResult, JsonRpcError> {
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or_else(|| JsonRpcError::invalid_params("Missing query parameter"))?;
 
     let collection = args.get("collection").and_then(|v| v.as_str());
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as usize;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
     let options = SearchOptions {
         mode,
@@ -199,20 +208,14 @@ fn tool_query(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| JsonRpcError::invalid_params("Missing query parameter"))?;
 
-    let mode_str = args
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("bm25");
+    let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("bm25");
 
     let mode: SearchMode = mode_str
         .parse()
         .map_err(|e: crate::Error| JsonRpcError::invalid_params(e.to_string()))?;
 
     let collection = args.get("collection").and_then(|v| v.as_str());
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as usize;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
     let options = SearchOptions {
         mode,
@@ -245,17 +248,42 @@ fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    // Parse path as collection/relative_path
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
-    if parts.len() != 2 {
-        return Err(JsonRpcError::invalid_params(
-            "Path must be in format 'collection/relative_path'",
-        ));
-    }
+    let from_line = args
+        .get("from_line")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
 
-    let doc = store
-        .get_document(parts[0], parts[1])
-        .map_err(|e| JsonRpcError::server_error(e.to_string()))?;
+    let max_lines = args
+        .get("max_lines")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    let line_numbers = args
+        .get("line_numbers")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Parse :linenum suffix if from_line not provided
+    let (clean_path, suffix_line) = crate::parse_path_with_line(path);
+    let effective_from = from_line.or(suffix_line);
+
+    // Check if input is a docid
+    let doc = if crate::store::is_docid(clean_path) {
+        store
+            .get_document_by_docid(clean_path)
+            .map_err(|e| JsonRpcError::server_error(e.to_string()))?
+    } else {
+        // Parse path as collection/relative_path
+        let parts: Vec<&str> = clean_path.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            return Err(JsonRpcError::invalid_params(
+                "Path must be in format 'collection/relative_path' or docid (#abc123)",
+            ));
+        }
+        store
+            .get_document(parts[0], parts[1])
+            .map_err(|e| JsonRpcError::server_error(e.to_string()))?
+    };
 
     let mut result = json!({
         "id": doc.id,
@@ -271,7 +299,20 @@ fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
     if include_content {
         if let Ok(content) = store.get_content(&doc.hash) {
             if let Ok(text) = String::from_utf8(content.data.clone()) {
-                result["content"] = json!(text);
+                // Apply line extraction
+                let mut output = crate::extract_lines(&text, effective_from, max_lines);
+
+                // Add line numbers if requested
+                if line_numbers {
+                    let start = effective_from.unwrap_or(1);
+                    output = crate::add_line_numbers(&output, start);
+                }
+
+                result["content"] = json!(output);
+                if let Some(from) = effective_from {
+                    result["fromLine"] = json!(from);
+                }
+                result["lineCount"] = json!(output.lines().count());
             } else {
                 result["contentPointer"] = json!(format!("{}/{}", doc.collection, doc.path));
             }
@@ -288,47 +329,26 @@ fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
 
 /// Execute multi_get tool (qfs_multi_get)
 fn tool_multi_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
-    let paths = args
-        .get("paths")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| JsonRpcError::invalid_params("Missing paths parameter"))?;
+    let pattern = args
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError::invalid_params("Missing pattern parameter"))?;
 
-    let include_content = args
-        .get("include_content")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let max_bytes = args
+        .get("max_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10240) as usize;
 
-    let mut results = Vec::new();
-    for path_value in paths {
-        if let Some(path) = path_value.as_str() {
-            let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 {
-                if let Ok(doc) = store.get_document(parts[0], parts[1]) {
-                    let mut result = json!({
-                        "id": doc.id,
-                        "collection": doc.collection,
-                        "path": doc.path,
-                        "title": doc.title,
-                        "fileType": doc.file_type,
-                        "hash": doc.hash
-                    });
+    let max_lines = args
+        .get("max_lines")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
 
-                    if include_content {
-                        if let Ok(content) = store.get_content(&doc.hash) {
-                            if let Ok(text) = String::from_utf8(content.data.clone()) {
-                                result["content"] = json!(text);
-                            }
-                            result["mimeType"] = json!(content.content_type);
-                        }
-                    }
+    let results = store
+        .multi_get(pattern, max_bytes, max_lines)
+        .map_err(|e| JsonRpcError::server_error(e.to_string()))?;
 
-                    results.push(result);
-                }
-            }
-        }
-    }
-
-    let text = serde_json::to_string_pretty(&json!({ "documents": results }))
+    let text = serde_json::to_string_pretty(&results)
         .map_err(|e| JsonRpcError::server_error(e.to_string()))?;
 
     Ok(ToolResult::text(text))
@@ -399,8 +419,16 @@ mod tests {
     fn test_tool_definitions_have_schemas() {
         let tools = get_tool_definitions();
         for tool in tools {
-            assert!(!tool.description.is_empty(), "{} has empty description", tool.name);
-            assert!(tool.input_schema.is_object(), "{} has invalid schema", tool.name);
+            assert!(
+                !tool.description.is_empty(),
+                "{} has empty description",
+                tool.name
+            );
+            assert!(
+                tool.input_schema.is_object(),
+                "{} has invalid schema",
+                tool.name
+            );
         }
     }
 

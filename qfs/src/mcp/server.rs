@@ -2,12 +2,12 @@
 //!
 //! Implements the stdio transport for the Model Context Protocol.
 
-use crate::store::Store;
 use super::protocol::{
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, MCP_PROTOCOL_VERSION,
-    ServerCapabilities, ServerInfo, ToolResult,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo, ToolResult,
+    MCP_PROTOCOL_VERSION,
 };
 use super::tools::{get_tool_definitions, handle_tool_call};
+use crate::store::Store;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -42,7 +42,10 @@ impl McpServer {
         let mut reader = BufReader::new(stdin.lock());
         let mut writer = stdout.lock();
 
-        tracing::info!("QFS MCP server started (protocol version {})", MCP_PROTOCOL_VERSION);
+        tracing::info!(
+            "QFS MCP server started (protocol version {})",
+            MCP_PROTOCOL_VERSION
+        );
 
         loop {
             let mut line = String::new();
@@ -109,7 +112,10 @@ impl McpServer {
     }
 
     /// Handle initialize request
-    fn handle_initialize(&self, _params: &Option<Value>) -> std::result::Result<Value, JsonRpcError> {
+    fn handle_initialize(
+        &self,
+        _params: &Option<Value>,
+    ) -> std::result::Result<Value, JsonRpcError> {
         let capabilities = ServerCapabilities::default();
         let server_info = ServerInfo::default();
 
@@ -127,7 +133,10 @@ impl McpServer {
     }
 
     /// Handle tools/call request
-    fn handle_tools_call(&self, params: &Option<Value>) -> std::result::Result<Value, JsonRpcError> {
+    fn handle_tools_call(
+        &self,
+        params: &Option<Value>,
+    ) -> std::result::Result<Value, JsonRpcError> {
         let params = params
             .as_ref()
             .ok_or_else(|| JsonRpcError::invalid_params("Missing params"))?;
@@ -141,8 +150,7 @@ impl McpServer {
 
         let result: ToolResult = handle_tool_call(&self.store, tool_name, &arguments)?;
 
-        serde_json::to_value(result)
-            .map_err(|e| JsonRpcError::server_error(e.to_string()))
+        serde_json::to_value(result).map_err(|e| JsonRpcError::server_error(e.to_string()))
     }
 }
 
@@ -182,10 +190,7 @@ mod tests {
         assert_eq!(tools.len(), 6);
 
         // Verify tool names
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"qfs_search"));
         assert!(names.contains(&"qfs_status"));
     }

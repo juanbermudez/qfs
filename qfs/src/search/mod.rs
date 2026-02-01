@@ -91,9 +91,15 @@ pub struct SearchResult {
     /// Document title
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Short document ID (first 6 chars of hash)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docid: Option<String>,
     /// Chunk index for vector search results
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_index: Option<i32>,
+    /// Context description for this document's location
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 /// Searcher for QFS
@@ -161,6 +167,14 @@ impl<'a> Searcher<'a> {
                     None
                 };
 
+                // Get context for this path
+                let context = self
+                    .store
+                    .get_all_contexts_for_path(&row.collection, &row.path)
+                    .ok()
+                    .map(|contexts| contexts.join("\n\n"))
+                    .filter(|s| !s.is_empty());
+
                 SearchResult {
                     id: row.id,
                     path: format!("{}/{}", row.collection, row.path),
@@ -175,7 +189,9 @@ impl<'a> Searcher<'a> {
                     line_start: None, // Could parse from snippet
                     collection: row.collection,
                     title: row.title,
+                    docid: Some(format!("#{}", crate::store::get_docid(&row.hash))),
                     chunk_index: None,
+                    context,
                 }
             })
             .filter(|r| r.score >= options.min_score)
@@ -197,7 +213,8 @@ impl<'a> Searcher<'a> {
         // For now, return an error indicating embeddings are needed
         // The actual search happens in search_vector_with_embedding
         Err(Error::EmbeddingError(
-            "Vector search requires query embedding. Use search_vector_with_embedding() instead.".to_string()
+            "Vector search requires query embedding. Use search_vector_with_embedding() instead."
+                .to_string(),
         ))
     }
 
@@ -208,7 +225,9 @@ impl<'a> Searcher<'a> {
         options: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
         // Get all embeddings
-        let embeddings = self.store.get_all_embeddings_for_search(options.collection.as_deref())?;
+        let embeddings = self
+            .store
+            .get_all_embeddings_for_search(options.collection.as_deref())?;
 
         if embeddings.is_empty() {
             return Err(Error::EmbeddingsRequired);
@@ -239,6 +258,14 @@ impl<'a> Searcher<'a> {
                     .unwrap_or(&row.path)
                     .to_string();
 
+                // Get context for this path
+                let context = self
+                    .store
+                    .get_all_contexts_for_path(&row.collection, &row.path)
+                    .ok()
+                    .map(|contexts| contexts.join("\n\n"))
+                    .filter(|s| !s.is_empty());
+
                 SearchResult {
                     id: row.doc_id,
                     path: format!("{}/{}", row.collection, row.path),
@@ -253,7 +280,9 @@ impl<'a> Searcher<'a> {
                     line_start: None,
                     collection: row.collection.clone(),
                     title: row.title.clone(),
+                    docid: Some(format!("#{}", crate::store::get_docid(&row.hash))),
                     chunk_index: Some(row.chunk_index),
+                    context,
                 }
             })
             .collect();
@@ -272,7 +301,8 @@ impl<'a> Searcher<'a> {
         // For hybrid search, we need the query embedding
         // This would be provided externally
         Err(Error::EmbeddingError(
-            "Hybrid search requires query embedding. Use search_hybrid_with_embedding() instead.".to_string()
+            "Hybrid search requires query embedding. Use search_hybrid_with_embedding() instead."
+                .to_string(),
         ))
     }
 
@@ -319,10 +349,7 @@ fn reciprocal_rank_fusion(
     // Add BM25 scores
     for (rank, result) in bm25_results.iter().enumerate() {
         let rrf_score = 1.0 / (k + rank as f64 + 1.0);
-        scores
-            .entry(result.id)
-            .or_insert((0.0, None))
-            .0 += rrf_score;
+        scores.entry(result.id).or_insert((0.0, None)).0 += rrf_score;
         if scores[&result.id].1.is_none() {
             scores.get_mut(&result.id).unwrap().1 = Some(result.clone());
         }
@@ -331,10 +358,7 @@ fn reciprocal_rank_fusion(
     // Add vector scores
     for (rank, result) in vector_results.iter().enumerate() {
         let rrf_score = 1.0 / (k + rank as f64 + 1.0);
-        scores
-            .entry(result.id)
-            .or_insert((0.0, None))
-            .0 += rrf_score;
+        scores.entry(result.id).or_insert((0.0, None)).0 += rrf_score;
         if scores[&result.id].1.is_none() {
             scores.get_mut(&result.id).unwrap().1 = Some(result.clone());
         }
@@ -351,7 +375,11 @@ fn reciprocal_rank_fusion(
         })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     results
 }
@@ -369,10 +397,7 @@ fn sanitize_fts_query(query: &str) -> String {
     }
 
     // Split into terms
-    let terms: Vec<&str> = query
-        .split_whitespace()
-        .filter(|t| !t.is_empty())
-        .collect();
+    let terms: Vec<&str> = query.split_whitespace().filter(|t| !t.is_empty()).collect();
 
     if terms.is_empty() {
         return String::new();
@@ -449,7 +474,10 @@ mod tests {
     #[test]
     fn test_sanitize_fts_query_basic() {
         assert_eq!(sanitize_fts_query("hello"), "\"hello\"*");
-        assert_eq!(sanitize_fts_query("hello world"), "\"hello\"* AND \"world\"*");
+        assert_eq!(
+            sanitize_fts_query("hello world"),
+            "\"hello\"* AND \"world\"*"
+        );
     }
 
     #[test]
@@ -501,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_bytes_to_embedding() {
-        let embedding = vec![1.0f32, 2.0, -3.5];
+        let embedding = [1.0f32, 2.0, -3.5];
         let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let restored = bytes_to_embedding(&bytes);
 
@@ -528,7 +556,9 @@ mod tests {
                 line_start: None,
                 collection: "test".to_string(),
                 title: None,
+                docid: None,
                 chunk_index: None,
+                context: None,
             },
             SearchResult {
                 id: 2,
@@ -544,7 +574,9 @@ mod tests {
                 line_start: None,
                 collection: "test".to_string(),
                 title: None,
+                docid: None,
                 chunk_index: None,
+                context: None,
             },
         ];
 
@@ -563,7 +595,9 @@ mod tests {
                 line_start: None,
                 collection: "test".to_string(),
                 title: None,
+                docid: None,
                 chunk_index: None,
+                context: None,
             },
             SearchResult {
                 id: 3,
@@ -579,7 +613,9 @@ mod tests {
                 line_start: None,
                 collection: "test".to_string(),
                 title: None,
+                docid: None,
                 chunk_index: None,
+                context: None,
             },
         ];
 

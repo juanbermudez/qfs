@@ -32,11 +32,7 @@ fn create_test_store() -> (Store, tempfile::TempDir, tempfile::TempDir) {
     // Create store and add collection
     let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
     store
-        .add_collection(
-            "docs",
-            content_dir.path().to_str().unwrap(),
-            &["**/*.md"],
-        )
+        .add_collection("docs", content_dir.path().to_str().unwrap(), &["**/*.md"])
         .unwrap();
 
     // Index the collection
@@ -126,7 +122,10 @@ fn test_basic_search() {
         .unwrap();
 
     // Should find the Rust guide
-    assert!(!results.is_empty(), "Should find results for 'rust programming'");
+    assert!(
+        !results.is_empty(),
+        "Should find results for 'rust programming'"
+    );
     assert!(
         results[0].path.contains("rust_guide"),
         "Top result should be rust_guide.md"
@@ -187,7 +186,10 @@ fn test_search_multiple_terms() {
         )
         .unwrap();
 
-    assert!(!results.is_empty(), "Should find results for 'memory safety'");
+    assert!(
+        !results.is_empty(),
+        "Should find results for 'memory safety'"
+    );
     assert!(
         results[0].path.contains("rust_guide"),
         "Top result should be rust_guide.md for 'memory safety'"
@@ -272,10 +274,7 @@ fn test_search_with_limit() {
         )
         .unwrap();
 
-    assert!(
-        results.len() <= 1,
-        "Should respect limit parameter"
-    );
+    assert!(results.len() <= 1, "Should respect limit parameter");
 }
 
 #[test]
@@ -297,7 +296,10 @@ fn test_search_collection_filter() {
         )
         .unwrap();
 
-    assert!(!results.is_empty(), "Should find results in docs collection");
+    assert!(
+        !results.is_empty(),
+        "Should find results in docs collection"
+    );
 
     // Search in non-existent collection
     let results = searcher
@@ -312,7 +314,10 @@ fn test_search_collection_filter() {
         )
         .unwrap();
 
-    assert!(results.is_empty(), "Should find no results in non-existent collection");
+    assert!(
+        results.is_empty(),
+        "Should find no results in non-existent collection"
+    );
 }
 
 #[test]
@@ -380,8 +385,7 @@ fn test_search_snippet_generation() {
         if let Some(ref snippet) = result.snippet {
             // FTS5 highlights with <mark> tags
             assert!(
-                snippet.to_lowercase().contains("ownership") ||
-                snippet.contains("<mark>"),
+                snippet.to_lowercase().contains("ownership") || snippet.contains("<mark>"),
                 "Snippet should contain search term or highlights: {}",
                 snippet
             );
@@ -419,16 +423,13 @@ fn test_incremental_indexing() {
     let path = content_dir.path().join("test.md");
     {
         let mut file = File::create(&path).unwrap();
-        file.write_all(b"# Initial Content\n\nThis is the first version.").unwrap();
+        file.write_all(b"# Initial Content\n\nThis is the first version.")
+            .unwrap();
     }
 
     let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
     store
-        .add_collection(
-            "test",
-            content_dir.path().to_str().unwrap(),
-            &["**/*.md"],
-        )
+        .add_collection("test", content_dir.path().to_str().unwrap(), &["**/*.md"])
         .unwrap();
 
     let indexer = Indexer::new(&store);
@@ -445,7 +446,8 @@ fn test_incremental_indexing() {
     // Modify the file
     {
         let mut file = File::create(&path).unwrap();
-        file.write_all(b"# Updated Content\n\nThis is the second version.").unwrap();
+        file.write_all(b"# Updated Content\n\nThis is the second version.")
+            .unwrap();
     }
 
     // Re-index with changes (should index)
@@ -466,4 +468,576 @@ fn test_incremental_indexing() {
         .unwrap();
 
     assert!(!results.is_empty(), "Should find updated content");
+}
+
+// =============================================================================
+// Document ID (docid) Tests
+// =============================================================================
+
+#[test]
+fn test_search_results_include_docid() {
+    let (store, _db_dir, _content_dir) = create_test_store();
+
+    let searcher = qfs::search::Searcher::new(&store);
+    let results = searcher
+        .search(
+            "rust",
+            SearchOptions {
+                mode: SearchMode::Bm25,
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert!(!results.is_empty(), "Should find results for 'rust'");
+
+    // Each result should have a docid
+    for result in &results {
+        assert!(result.docid.is_some(), "Search result should include docid");
+        let docid = result.docid.as_ref().unwrap();
+        assert!(
+            docid.starts_with('#'),
+            "Docid should start with #, got: {}",
+            docid
+        );
+        // Remove # prefix and check length
+        let id = &docid[1..];
+        assert_eq!(id.len(), 6, "Docid should be 6 characters after #");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "Docid should be hexadecimal"
+        );
+    }
+}
+
+#[test]
+fn test_get_document_by_docid() {
+    let (store, _db_dir, _content_dir) = create_test_store();
+
+    // First, get a document to find its hash
+    let doc = store.get_document("docs", "rust_guide.md").unwrap();
+    let short_id = qfs::store::get_docid(&doc.hash);
+
+    // Now retrieve by docid with # prefix
+    let found = store
+        .get_document_by_docid(&format!("#{}", short_id))
+        .unwrap();
+    assert_eq!(found.path, "rust_guide.md");
+
+    // Also works without # prefix
+    let found = store.get_document_by_docid(short_id).unwrap();
+    assert_eq!(found.path, "rust_guide.md");
+}
+
+#[test]
+fn test_docid_is_first_6_chars_of_hash() {
+    use qfs::store::get_docid;
+
+    let hash = "abc123def456789012345678901234567890123456789012345678901234";
+    assert_eq!(get_docid(hash), "abc123");
+
+    let short_hash = "abcd";
+    assert_eq!(get_docid(short_hash), "abcd");
+}
+
+#[test]
+fn test_normalize_docid_formats() {
+    use qfs::store::normalize_docid;
+
+    // With hash prefix
+    assert_eq!(normalize_docid("#abc123"), "abc123");
+
+    // Without prefix
+    assert_eq!(normalize_docid("abc123"), "abc123");
+
+    // With quotes and hash
+    assert_eq!(normalize_docid("\"#abc123\""), "abc123");
+    assert_eq!(normalize_docid("'abc123'"), "abc123");
+
+    // With whitespace
+    assert_eq!(normalize_docid("  #abc123  "), "abc123");
+}
+
+#[test]
+fn test_is_docid_validation() {
+    use qfs::store::is_docid;
+
+    // Valid docids
+    assert!(is_docid("#abc123"));
+    assert!(is_docid("abc123"));
+    assert!(is_docid("ABC123")); // Case insensitive hex
+    assert!(is_docid("abc123def456")); // Longer is ok
+
+    // Invalid docids
+    assert!(!is_docid("abc12")); // Too short
+    assert!(!is_docid("ghijkl")); // Non-hex characters
+    assert!(!is_docid("abc123.md")); // Has extension
+    assert!(!is_docid("qfs://collection/path")); // Virtual path
+}
+
+// =============================================================================
+// Line Range Extraction Tests
+// =============================================================================
+
+#[test]
+fn test_parse_path_with_line_suffix() {
+    use qfs::parse_path_with_line;
+
+    let (path, line) = parse_path_with_line("docs/file.md:50");
+    assert_eq!(path, "docs/file.md");
+    assert_eq!(line, Some(50));
+}
+
+#[test]
+fn test_parse_path_without_line_suffix() {
+    use qfs::parse_path_with_line;
+
+    let (path, line) = parse_path_with_line("docs/file.md");
+    assert_eq!(path, "docs/file.md");
+    assert_eq!(line, None);
+}
+
+#[test]
+fn test_parse_path_with_colon_not_linenum() {
+    use qfs::parse_path_with_line;
+
+    // Colons followed by non-digits should not be parsed as line numbers
+    let (path, line) = parse_path_with_line("docs/10:30_meeting.md");
+    assert_eq!(path, "docs/10:30_meeting.md");
+    assert_eq!(line, None);
+}
+
+#[test]
+fn test_extract_lines_from_middle() {
+    use qfs::extract_lines;
+
+    let content = "line1\nline2\nline3\nline4\nline5";
+    let result = extract_lines(content, Some(2), Some(2));
+    assert_eq!(result, "line2\nline3");
+}
+
+#[test]
+fn test_extract_lines_to_end() {
+    use qfs::extract_lines;
+
+    let content = "line1\nline2\nline3";
+    let result = extract_lines(content, Some(2), None);
+    assert_eq!(result, "line2\nline3");
+}
+
+#[test]
+fn test_extract_lines_out_of_bounds() {
+    use qfs::extract_lines;
+
+    let content = "line1\nline2";
+    let result = extract_lines(content, Some(10), None);
+    assert_eq!(result, "");
+}
+
+#[test]
+fn test_extract_lines_max_exceeds_length() {
+    use qfs::extract_lines;
+
+    let content = "line1\nline2\nline3";
+    let result = extract_lines(content, Some(2), Some(100));
+    assert_eq!(result, "line2\nline3");
+}
+
+#[test]
+fn test_add_line_numbers_from_start() {
+    use qfs::add_line_numbers;
+
+    let text = "foo\nbar\nbaz";
+    let result = add_line_numbers(text, 1);
+    assert_eq!(result, "1: foo\n2: bar\n3: baz");
+}
+
+#[test]
+fn test_add_line_numbers_from_offset() {
+    use qfs::add_line_numbers;
+
+    let text = "foo\nbar\nbaz";
+    let result = add_line_numbers(text, 10);
+    assert_eq!(result, "10: foo\n11: bar\n12: baz");
+}
+
+// =============================================================================
+// Multi-get with Patterns Tests
+// =============================================================================
+
+fn setup_multi_get_store() -> (Store, tempfile::TempDir, tempfile::TempDir) {
+    let db_dir = tempdir().unwrap();
+    let content_dir = tempdir().unwrap();
+
+    // Create nested directory structure
+    std::fs::create_dir_all(content_dir.path().join("docs")).unwrap();
+    std::fs::create_dir_all(content_dir.path().join("src")).unwrap();
+
+    // Create files
+    let files = [
+        ("docs/readme.md", "# Readme\nThis is the readme."),
+        ("docs/guide.md", "# Guide\nThis is the guide."),
+        ("src/main.rs", "fn main() {\n    println!(\"Hello\");\n}"),
+        ("config.toml", "[settings]\nvalue = 1"),
+    ];
+
+    for (path, content) in files {
+        let full_path = content_dir.path().join(path);
+        let mut file = File::create(&full_path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+    }
+
+    // Create a large file
+    let large_content = "x".repeat(20000);
+    let large_path = content_dir.path().join("docs/large.txt");
+    let mut large_file = File::create(&large_path).unwrap();
+    large_file.write_all(large_content.as_bytes()).unwrap();
+
+    let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+    store
+        .add_collection("test", content_dir.path().to_str().unwrap(), &["**/*"])
+        .unwrap();
+
+    let indexer = Indexer::new(&store);
+    indexer.index_collection("test").unwrap();
+
+    (store, db_dir, content_dir)
+}
+
+#[test]
+fn test_multi_get_glob_pattern() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+
+    let results = store.multi_get("test/**/*.md", 10240, None).unwrap();
+
+    assert_eq!(results.len(), 2, "Should find 2 .md files");
+    assert!(
+        results.iter().all(|r| r.path.ends_with(".md")),
+        "All results should be .md files"
+    );
+    assert!(
+        results.iter().all(|r| !r.skipped),
+        "No files should be skipped"
+    );
+}
+
+#[test]
+fn test_multi_get_comma_separated() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+
+    let results = store
+        .multi_get("test/docs/readme.md, test/docs/guide.md", 10240, None)
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|r| r.path == "test/docs/readme.md"));
+    assert!(results.iter().any(|r| r.path == "test/docs/guide.md"));
+}
+
+#[test]
+fn test_multi_get_max_bytes_skips_large_files() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+
+    // Use a small max_bytes to trigger skipping
+    let results = store.multi_get("test/docs/**/*", 1024, None).unwrap();
+
+    // The large.txt file should be skipped
+    let large = results.iter().find(|r| r.path.contains("large"));
+    assert!(large.is_some(), "Should find large file in results");
+    let large = large.unwrap();
+    assert!(large.skipped, "Large file should be skipped");
+    assert!(large.skip_reason.is_some(), "Should have skip reason");
+    assert!(
+        large.content.is_none(),
+        "Skipped file should have no content"
+    );
+}
+
+#[test]
+fn test_multi_get_max_lines_truncates() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+
+    // Get a file with max 1 line
+    let results = store
+        .multi_get("test/docs/readme.md", 10240, Some(1))
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    let content = results[0].content.as_ref().unwrap();
+    assert!(
+        content.contains("[... truncated"),
+        "Content should indicate truncation"
+    );
+}
+
+#[test]
+fn test_multi_get_no_matches() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+
+    let results = store
+        .multi_get("nonexistent/**/*.xyz", 10240, None)
+        .unwrap();
+
+    assert!(results.is_empty(), "Should return empty for no matches");
+}
+
+// =============================================================================
+// Ls Command Tests
+// =============================================================================
+
+#[test]
+fn test_list_collections() {
+    let (store, _db_dir, _content_dir) = create_test_store();
+
+    let collections = store.list_collections().unwrap();
+    assert_eq!(collections.len(), 1);
+    assert_eq!(collections[0].name, "docs");
+}
+
+#[test]
+fn test_list_files_in_collection() {
+    let (store, _db_dir, _content_dir) = create_test_store();
+
+    let files = store.list_files("docs", None).unwrap();
+    assert_eq!(files.len(), 3, "Should have 3 files");
+
+    // All files should have required fields
+    for file in &files {
+        assert_eq!(file.collection, "docs");
+        assert!(!file.path.is_empty());
+        assert!(file.size > 0);
+    }
+}
+
+#[test]
+fn test_list_files_with_path_prefix() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+
+    // List only files in docs directory
+    let files = store.list_files("test", Some("docs")).unwrap();
+
+    // Should find files under docs/
+    assert!(!files.is_empty());
+    assert!(
+        files.iter().all(|f| f.path.starts_with("docs")),
+        "All files should be under docs/"
+    );
+}
+
+#[test]
+fn test_list_files_nonexistent_collection() {
+    let (store, _db_dir, _content_dir) = create_test_store();
+
+    let files = store.list_files("nonexistent", None).unwrap();
+    assert!(files.is_empty());
+}
+
+// =============================================================================
+// Context System Tests
+// =============================================================================
+
+#[test]
+fn test_set_and_get_global_context() {
+    let store = Store::open_memory().unwrap();
+
+    store
+        .set_context(None, "/", "Global context for all files")
+        .unwrap();
+
+    let ctx = store.get_global_context().unwrap();
+    assert_eq!(ctx, Some("Global context for all files".to_string()));
+}
+
+#[test]
+fn test_set_and_find_collection_context() {
+    let store = Store::open_memory().unwrap();
+    store
+        .add_collection("docs", "/tmp/docs", &["**/*.md"])
+        .unwrap();
+
+    // Set hierarchical contexts
+    store.set_context(Some("docs"), "/", "Documentation").unwrap();
+    store
+        .set_context(Some("docs"), "/api", "API reference")
+        .unwrap();
+    store
+        .set_context(Some("docs"), "/api/v2", "API v2 docs")
+        .unwrap();
+
+    // Most specific match wins
+    let ctx = store
+        .find_context_for_path("docs", "/api/v2/endpoints.md")
+        .unwrap();
+    assert_eq!(ctx, Some("API v2 docs".to_string()));
+
+    let ctx = store
+        .find_context_for_path("docs", "/api/v1/old.md")
+        .unwrap();
+    assert_eq!(ctx, Some("API reference".to_string()));
+
+    let ctx = store.find_context_for_path("docs", "/readme.md").unwrap();
+    assert_eq!(ctx, Some("Documentation".to_string()));
+}
+
+#[test]
+fn test_context_longest_prefix_matching() {
+    let store = Store::open_memory().unwrap();
+    store
+        .add_collection("code", "/tmp/code", &["**/*.rs"])
+        .unwrap();
+
+    store.set_context(Some("code"), "/", "Rust codebase").unwrap();
+    store
+        .set_context(Some("code"), "/src", "Source files")
+        .unwrap();
+    store
+        .set_context(Some("code"), "/src/handlers", "HTTP handlers")
+        .unwrap();
+
+    // Should match the longest prefix
+    let ctx = store
+        .find_context_for_path("code", "/src/handlers/auth.rs")
+        .unwrap();
+    assert_eq!(ctx, Some("HTTP handlers".to_string()));
+
+    // Falls back to shorter prefix when no exact match
+    let ctx = store
+        .find_context_for_path("code", "/src/models/user.rs")
+        .unwrap();
+    assert_eq!(ctx, Some("Source files".to_string()));
+}
+
+#[test]
+fn test_global_context_fallback() {
+    let store = Store::open_memory().unwrap();
+    store
+        .add_collection("docs", "/tmp/docs", &["**/*.md"])
+        .unwrap();
+
+    store
+        .set_context(None, "/", "Global fallback context")
+        .unwrap();
+
+    // Collection has no specific context, should fallback to global
+    let ctx = store
+        .find_context_for_path("docs", "/any/path.md")
+        .unwrap();
+    assert_eq!(ctx, Some("Global fallback context".to_string()));
+}
+
+#[test]
+fn test_get_all_contexts_for_path() {
+    let store = Store::open_memory().unwrap();
+    store
+        .add_collection("docs", "/tmp/docs", &["**/*.md"])
+        .unwrap();
+
+    store.set_context(None, "/", "Global").unwrap();
+    store.set_context(Some("docs"), "/", "Docs").unwrap();
+    store.set_context(Some("docs"), "/api", "API").unwrap();
+
+    // Get all matching contexts (general to specific)
+    let contexts = store
+        .get_all_contexts_for_path("docs", "/api/file.md")
+        .unwrap();
+    assert_eq!(contexts, vec!["Global", "Docs", "API"]);
+}
+
+#[test]
+fn test_context_appears_in_search_results() {
+    let (store, _db_dir, _content_dir) = create_test_store();
+
+    // Set context for the collection
+    store
+        .set_context(Some("docs"), "/", "Programming guides")
+        .unwrap();
+
+    let searcher = qfs::search::Searcher::new(&store);
+    let results = searcher
+        .search(
+            "rust",
+            SearchOptions {
+                mode: SearchMode::Bm25,
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert!(!results.is_empty());
+
+    // Results should include context
+    let has_context = results.iter().any(|r| r.context.is_some());
+    assert!(has_context, "At least one result should have context");
+
+    // Check context content
+    for result in &results {
+        if let Some(ref ctx) = result.context {
+            assert!(
+                ctx.contains("Programming guides"),
+                "Context should contain our set context"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_remove_context() {
+    let store = Store::open_memory().unwrap();
+    store
+        .set_context(Some("docs"), "/api", "API context")
+        .unwrap();
+
+    // Remove should succeed
+    assert!(store.remove_context(Some("docs"), "/api").unwrap());
+
+    // Second remove should return false (already removed)
+    assert!(!store.remove_context(Some("docs"), "/api").unwrap());
+}
+
+#[test]
+fn test_list_contexts() {
+    let store = Store::open_memory().unwrap();
+    store.set_context(None, "/", "Global").unwrap();
+    store.set_context(Some("docs"), "/", "Docs").unwrap();
+    store.set_context(Some("docs"), "/api", "API").unwrap();
+
+    let contexts = store.list_contexts().unwrap();
+    assert_eq!(contexts.len(), 3);
+
+    // First should be global (sorted)
+    assert_eq!(contexts[0].collection, None);
+    assert_eq!(contexts[0].path_prefix, "/");
+    assert_eq!(contexts[0].context, "Global");
+}
+
+#[test]
+fn test_delete_context() {
+    let store = Store::open_memory().unwrap();
+    store.set_context(None, "/", "Global").unwrap();
+
+    let removed = store.remove_context(None, "/").unwrap();
+    assert!(removed);
+
+    let ctx = store.get_global_context().unwrap();
+    assert_eq!(ctx, None);
+}
+
+#[test]
+fn test_get_collections_without_context() {
+    let store = Store::open_memory().unwrap();
+    store
+        .add_collection("docs", "/tmp/docs", &["**/*.md"])
+        .unwrap();
+    store
+        .add_collection("code", "/tmp/code", &["**/*.rs"])
+        .unwrap();
+
+    // Add context only to docs
+    store.set_context(Some("docs"), "/", "Docs").unwrap();
+
+    let without = store.get_collections_without_context().unwrap();
+    assert_eq!(without.len(), 1);
+    assert_eq!(without[0].name, "code");
 }

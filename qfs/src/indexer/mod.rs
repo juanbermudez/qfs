@@ -156,7 +156,8 @@ impl<'a> Indexer<'a> {
         let parsed = parse_file(path, &content)?;
 
         // Store content
-        self.store.insert_content(&hash, &content, &parsed.mime_type)?;
+        self.store
+            .insert_content(&hash, &content, &parsed.mime_type)?;
 
         // Get file extension
         let file_type = path
@@ -197,7 +198,11 @@ impl IndexProgress for NoopProgress {
 
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+        bytes
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
     }
 }
 
@@ -228,7 +233,9 @@ mod tests {
         let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
 
         // Add collection
-        store.add_collection("test", dir.path().to_str().unwrap(), &["**/*.md"]).unwrap();
+        store
+            .add_collection("test", dir.path().to_str().unwrap(), &["**/*.md"])
+            .unwrap();
 
         // Index
         let indexer = Indexer::new(&store);
@@ -256,7 +263,9 @@ mod tests {
 
         // Create store and index
         let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
-        store.add_collection("test", dir.path().to_str().unwrap(), &["**/*.md"]).unwrap();
+        store
+            .add_collection("test", dir.path().to_str().unwrap(), &["**/*.md"])
+            .unwrap();
 
         let indexer = Indexer::new(&store);
 

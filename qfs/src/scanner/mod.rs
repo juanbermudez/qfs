@@ -44,7 +44,11 @@ impl Scanner {
             .map(|p| Pattern::new(p))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        Ok(Scanner { root, patterns, exclude })
+        Ok(Scanner {
+            root,
+            patterns,
+            exclude,
+        })
     }
 
     /// Scan for all matching files
@@ -59,7 +63,8 @@ impl Scanner {
             .filter_map(|e| {
                 let metadata = e.metadata().ok()?;
                 let modified = metadata.modified().ok()?;
-                let relative_path = e.path()
+                let relative_path = e
+                    .path()
                     .strip_prefix(&self.root)
                     .ok()?
                     .to_string_lossy()
@@ -91,10 +96,7 @@ impl Scanner {
             .unwrap_or_default();
 
         // Also get the filename for simple patterns like "*.md"
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // Normalize path separators for cross-platform compatibility
         let relative_normalized = relative.replace('\\', "/");
@@ -110,9 +112,8 @@ impl Scanner {
             let pattern_str = p.as_str();
 
             // For patterns starting with **/, match against path or any suffix
-            if pattern_str.starts_with("**/") {
+            if let Some(suffix) = pattern_str.strip_prefix("**/") {
                 // Get the suffix pattern after **/
-                let suffix = &pattern_str[3..];
                 if let Ok(suffix_pattern) = Pattern::new(suffix) {
                     // Match if filename matches the suffix pattern
                     if suffix_pattern.matches_with(filename, options) {
@@ -210,7 +211,9 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|r| r.relative_path == "file1.md"));
-        assert!(results.iter().any(|r| r.relative_path.ends_with("file3.md")));
+        assert!(results
+            .iter()
+            .any(|r| r.relative_path.ends_with("file3.md")));
     }
 
     #[test]

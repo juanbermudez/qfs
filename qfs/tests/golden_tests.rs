@@ -203,7 +203,10 @@ fn execute_search(
 }
 
 /// Compare actual results against golden expectations
-fn verify_golden_search(actual: &[ActualSearchResult], golden: &GoldenSearch) -> Result<(), String> {
+fn verify_golden_search(
+    actual: &[ActualSearchResult],
+    golden: &GoldenSearch,
+) -> Result<(), String> {
     // Check minimum count
     if actual.len() < golden.min_count {
         return Err(format!(
@@ -227,7 +230,9 @@ fn verify_golden_search(actual: &[ActualSearchResult], golden: &GoldenSearch) ->
     // Check expected top results
     for (i, expected) in golden.top_results.iter().enumerate() {
         // Find result matching path_contains
-        let matching = actual.iter().find(|r| r.path.contains(&expected.path_contains));
+        let matching = actual
+            .iter()
+            .find(|r| r.path.contains(&expected.path_contains));
 
         if let Some(result) = matching {
             // Check max_rank if specified
@@ -522,11 +527,7 @@ fn test_golden_search_no_results() {
 fn test_golden_search_case_insensitive() {
     let ctx = setup_test_context();
 
-    let test_cases = vec![
-        ("rust", "RUST"),
-        ("async", "ASYNC"),
-        ("memory", "Memory"),
-    ];
+    let test_cases = vec![("rust", "RUST"), ("async", "ASYNC"), ("memory", "Memory")];
 
     for (lower, upper) in test_cases {
         let lower_results = execute_search(&ctx.store, lower, SearchMode::Bm25, 20);

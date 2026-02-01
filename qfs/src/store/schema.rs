@@ -74,6 +74,19 @@ CREATE TABLE IF NOT EXISTS index_state (
     value TEXT NOT NULL
 );
 
+-- Path contexts (hierarchical context descriptions for AI agents)
+CREATE TABLE IF NOT EXISTS path_contexts (
+    id INTEGER PRIMARY KEY,
+    collection TEXT,              -- NULL for global context, collection name otherwise
+    path_prefix TEXT NOT NULL,    -- Path prefix (e.g., "/", "/guides", "/api/v2")
+    context TEXT NOT NULL,        -- Description text
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(collection, path_prefix)
+);
+
+CREATE INDEX IF NOT EXISTS idx_path_contexts_collection ON path_contexts(collection);
+
 -- Note: FTS5 doesn't support traditional triggers, so we sync manually
 -- in the application code using DELETE + INSERT pattern.
 -- This is the recommended approach for FTS5 external content.
@@ -119,7 +132,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 
 /// Migrate from an older schema version
 fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
-    tracing::info!("Migrating database from version {} to {}", from_version, SCHEMA_VERSION);
+    tracing::info!(
+        "Migrating database from version {} to {}",
+        from_version,
+        SCHEMA_VERSION
+    );
 
     // Add migration steps here as schema evolves
     // For now, we only have version 1
