@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["qfs", "qfs-cli", "qfs-embed", "qfs-mcp"]
+exclude = ["libsql-test"]
 
 [workspace.package]
 version = "0.1.0"
