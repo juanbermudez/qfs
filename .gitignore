@@ -31,3 +31,12 @@ lcov.info
 *.bak
 *.orig
 libsql-test/target/
+
+# Claude Code / AI steering
+.task/
+CLAUDE.md
+IMPLEMENTATION_PLAN.md
+*.skill
+
+# Embedding cache
+.fastembed_cache/
