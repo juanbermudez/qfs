@@ -22,8 +22,8 @@ qfs context add notes "Personal notes and ideas"
 qfs context add docs "Work documentation"
 qfs context add code "Source code and projects"
 
-# Generate embeddings for semantic search
-qfs index
+# Generate embeddings for semantic search (first run downloads model)
+qfs embed
 
 # Search across everything
 qfs search "project timeline"              # Fast keyword search
@@ -114,7 +114,7 @@ QFS exposes an MCP (Model Context Protocol) server for tighter integration with 
               ▼                        │                        ▼
      ┌─────────────────┐               │               ┌─────────────────┐
      │   BM25 Search   │               │               │  Vector Search  │
-     │   (SQLite FTS5) │               │               │   (fastembed)   │
+     │   (SQLite FTS5) │               │               │ (libsql native) │
      └────────┬────────┘               │               └────────┬────────┘
               │                        │                        │
               │  rank 1: doc_a         │         rank 1: doc_b  │
@@ -137,6 +137,10 @@ QFS exposes an MCP (Model Context Protocol) server for tighter integration with 
                               3. doc_c (0.016)
                               4. doc_d (0.016)
 ```
+
+### Vector Search
+
+Vector search uses libsql's native vector indexing with `vector_top_k()` for O(log n) approximate nearest neighbor search. Embeddings are stored as F32_BLOB(384) and indexed with cosine distance metric.
 
 ## Score Normalization
 
@@ -216,7 +220,7 @@ qfs ls notes --format json
 ### Indexing
 
 ```sh
-# Index all collections
+# Index all collections (builds FTS5 full-text index)
 qfs index
 
 # Index a specific collection
@@ -225,6 +229,26 @@ qfs index notes
 # Show index status
 qfs status
 ```
+
+### Generating Embeddings
+
+Embeddings enable vector and hybrid search modes. The first run downloads the model (~90MB).
+
+```sh
+# Generate embeddings for all indexed documents
+qfs embed
+
+# Generate for a specific collection
+qfs embed notes
+
+# Force re-generation of all embeddings
+qfs embed --force
+
+# Show embedding status
+qfs status
+```
+
+The embedding model is `all-MiniLM-L6-v2` (384 dimensions) via fastembed. Embeddings are stored in libsql's native F32_BLOB format for efficient vector indexing.
 
 ### Context Management
 
@@ -286,6 +310,12 @@ qfs search "how to login" --mode vector
 
 # Hybrid search (best quality)
 qfs search "user authentication" --mode hybrid
+
+# Search within a date range
+qfs search "meeting notes" --from-date 2025-01-01 --to-date 2025-01-31
+
+# Search documents modified after a date
+qfs search "project updates" --from-date 2025-06-01
 ```
 
 ### Get and Multi-Get
@@ -329,6 +359,8 @@ qfs multi-get "docs/*.md" --format json
 -n, --limit <num>        # Number of results (default: 20)
 -m, --mode <mode>        # bm25, vector, hybrid (default: bm25)
 -c, --collection <name>  # Restrict to a collection
+--from-date <date>       # Filter by modified date (ISO 8601, e.g., 2025-01-01)
+--to-date <date>         # Filter by modified date (ISO 8601, e.g., 2025-12-31)
 --min-score <num>        # Minimum score threshold (default: 0.0)
 --include-binary         # Include binary files in results
 -o, --format <format>    # text, json (default: text)
@@ -439,11 +471,54 @@ embeddings      -- Vector embeddings for semantic search
 |---------|-----|-----|
 | **Language** | TypeScript/Bun | Rust |
 | **Runtime** | Node.js + GGUF models | Native binary |
-| **Embeddings** | embeddinggemma (300MB) | fastembed |
+| **Embeddings** | embeddinggemma (768d, 300MB) | fastembed all-MiniLM-L6-v2 (384d, 90MB) |
+| **Vector Storage** | sqlite-vec virtual table | libsql F32_BLOB + vector_top_k() |
+| **Vector Search** | O(n) two-step query | O(log n) native KNN index |
 | **LLM Re-ranking** | Yes | No |
 | **Query Expansion** | Yes | No |
 | **Binary Size** | ~3GB (with models) | ~15MB |
 | **Startup Time** | Slower (model loading) | Instant |
+
+## Claude Code Plugin
+
+QFS is available as a Claude Code plugin for seamless integration:
+
+```
+qfs-plugin/
+├── .claude-plugin/plugin.json  # Plugin manifest
+├── .mcp.json                   # MCP server configuration
+└── skills/qfs-agent/           # Agent skill with guidance
+```
+
+### Installation
+
+1. Install the QFS CLI (must be in PATH):
+```sh
+cargo install --path qfs-cli
+```
+
+2. Install the plugin:
+```sh
+# Local installation
+claude --plugin-dir ./qfs-plugin
+
+# Or via marketplace (when published)
+/plugin install qfs
+```
+
+The plugin provides:
+- **MCP Tools**: `qfs_search`, `qfs_vsearch`, `qfs_query`, `qfs_get`, `qfs_multi_get`, `qfs_status`
+- **Skill**: Agent guidance for effective QFS usage
+
+### Distribution Options
+
+| Option | Description |
+|--------|-------------|
+| **Plugin + CLI** | Users install CLI separately, plugin configures MCP server |
+| **Bundled Binary** | Plugin includes platform-specific binaries in `bin/` |
+| **Marketplace** | Publish to plugin marketplace for `/plugin install qfs` |
+
+See `qfs-plugin/README.md` for detailed distribution instructions.
 
 ## License
 

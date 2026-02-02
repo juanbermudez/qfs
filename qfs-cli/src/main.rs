@@ -78,6 +78,28 @@ enum Commands {
         name: Option<String>,
     },
 
+    /// Generate embeddings for documents
+    Embed {
+        /// Collection name (embed all if not specified)
+        name: Option<String>,
+
+        /// Force re-embedding of all documents
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Embedding model (default, minilm, bge)
+        #[arg(long, short = 'm', default_value = "default")]
+        model: String,
+
+        /// Chunk size in words
+        #[arg(long, default_value = "256")]
+        chunk_size: usize,
+
+        /// Chunk overlap in words
+        #[arg(long, default_value = "32")]
+        overlap: usize,
+    },
+
     /// Search for documents
     Search {
         /// Search query
@@ -98,6 +120,14 @@ enum Commands {
         /// Filter by collection
         #[arg(long, short = 'c')]
         collection: Option<String>,
+
+        /// Filter documents modified on or after this date (ISO 8601, e.g., 2025-01-01)
+        #[arg(long)]
+        from_date: Option<String>,
+
+        /// Filter documents modified on or before this date (ISO 8601, e.g., 2025-12-31)
+        #[arg(long)]
+        to_date: Option<String>,
 
         /// Include binary files in results
         #[arg(long)]
@@ -188,7 +218,8 @@ enum ContextAction {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -212,69 +243,83 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Init => cmd_init(&db_path),
+        Commands::Init => cmd_init(&db_path).await,
         Commands::Add {
             name,
             path,
             patterns,
             exclude,
-        } => cmd_add(&db_path, &name, &path, &patterns, &exclude),
-        Commands::Remove { name } => cmd_remove(&db_path, &name),
-        Commands::List => cmd_list(&db_path),
-        Commands::Ls { path, format } => cmd_ls(&db_path, path.as_deref(), &format),
-        Commands::Index { name } => cmd_index(&db_path, name.as_deref()),
+        } => cmd_add(&db_path, &name, &path, &patterns, &exclude).await,
+        Commands::Remove { name } => cmd_remove(&db_path, &name).await,
+        Commands::List => cmd_list(&db_path).await,
+        Commands::Ls { path, format } => cmd_ls(&db_path, path.as_deref(), &format).await,
+        Commands::Index { name } => cmd_index(&db_path, name.as_deref()).await,
+        Commands::Embed {
+            name,
+            force,
+            model,
+            chunk_size,
+            overlap,
+        } => cmd_embed(&db_path, name.as_deref(), force, &model, chunk_size, overlap).await,
         Commands::Search {
             query,
             mode,
             limit,
             min_score,
             collection,
+            from_date,
+            to_date,
             include_binary,
             format,
-        } => cmd_search(
-            &db_path,
-            &query,
-            &mode,
-            limit,
-            min_score,
-            collection.as_deref(),
-            include_binary,
-            &format,
-        ),
+        } => {
+            cmd_search(
+                &db_path,
+                &query,
+                &mode,
+                limit,
+                min_score,
+                collection.as_deref(),
+                from_date.as_deref(),
+                to_date.as_deref(),
+                include_binary,
+                &format,
+            )
+            .await
+        }
         Commands::Get {
             path,
             from,
             max_lines,
             line_numbers,
             format,
-        } => cmd_get(&db_path, &path, from, max_lines, line_numbers, &format),
+        } => cmd_get(&db_path, &path, from, max_lines, line_numbers, &format).await,
         Commands::MultiGet {
             pattern,
             max_bytes,
             max_lines,
             format,
-        } => cmd_multi_get(&db_path, &pattern, max_bytes, max_lines, &format),
-        Commands::Status => cmd_status(&db_path),
-        Commands::Serve => cmd_serve(&db_path),
-        Commands::Context { action } => cmd_context(&db_path, action),
+        } => cmd_multi_get(&db_path, &pattern, max_bytes, max_lines, &format).await,
+        Commands::Status => cmd_status(&db_path).await,
+        Commands::Serve => cmd_serve(&db_path).await,
+        Commands::Context { action } => cmd_context(&db_path, action).await,
     }
 }
 
-fn cmd_init(db_path: &Path) -> Result<()> {
+async fn cmd_init(db_path: &Path) -> Result<()> {
     println!("Initializing QFS database at: {}", db_path.display());
-    let _store = Store::open(db_path)?;
+    let _store = Store::open(db_path).await?;
     println!("Database initialized successfully.");
     Ok(())
 }
 
-fn cmd_add(
+async fn cmd_add(
     db_path: &Path,
     name: &str,
     path: &Path,
     patterns: &[String],
     exclude: &[String],
 ) -> Result<()> {
-    let store = Store::open(db_path)?;
+    let store = Store::open(db_path).await?;
 
     let pattern_refs: Vec<&str> = if patterns.is_empty() {
         vec!["**/*"]
@@ -283,7 +328,7 @@ fn cmd_add(
     };
 
     let path_str = path.to_string_lossy();
-    store.add_collection(name, &path_str, &pattern_refs)?;
+    store.add_collection(name, &path_str, &pattern_refs).await?;
 
     // Store exclude patterns (would need schema update)
     let _ = exclude; // TODO: implement exclude patterns in schema
@@ -292,16 +337,16 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_remove(db_path: &Path, name: &str) -> Result<()> {
-    let store = Store::open(db_path)?;
-    store.remove_collection(name)?;
+async fn cmd_remove(db_path: &Path, name: &str) -> Result<()> {
+    let store = Store::open(db_path).await?;
+    store.remove_collection(name).await?;
     println!("Removed collection '{}'", name);
     Ok(())
 }
 
-fn cmd_list(db_path: &Path) -> Result<()> {
-    let store = Store::open(db_path)?;
-    let collections = store.list_collections()?;
+async fn cmd_list(db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path).await?;
+    let collections = store.list_collections().await?;
 
     if collections.is_empty() {
         println!("No collections found. Use 'qfs add' to add a collection.");
@@ -310,7 +355,7 @@ fn cmd_list(db_path: &Path) -> Result<()> {
 
     println!("Collections:");
     for col in collections {
-        let doc_count = store.count_documents(Some(&col.name)).unwrap_or(0);
+        let doc_count = store.count_documents(Some(&col.name)).await.unwrap_or(0);
         println!(
             "  {} ({} documents)\n    Path: {}",
             col.name, doc_count, col.path
@@ -381,13 +426,13 @@ fn parse_ls_path(path: &str) -> (String, Option<String>) {
     }
 }
 
-fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
-    let store = Store::open(db_path)?;
+async fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
+    let store = Store::open(db_path).await?;
 
     match path {
         None => {
             // List all collections
-            let collections = store.list_collections()?;
+            let collections = store.list_collections().await?;
 
             if collections.is_empty() {
                 println!("No collections found. Use 'qfs add' to add a collection.");
@@ -395,22 +440,20 @@ fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
             }
 
             if format == "json" {
-                let data: Vec<_> = collections
-                    .iter()
-                    .map(|c| {
-                        let count = store.count_documents(Some(&c.name)).unwrap_or(0);
-                        serde_json::json!({
-                            "name": c.name,
-                            "path": c.path,
-                            "documents": count,
-                        })
-                    })
-                    .collect();
+                let mut data = Vec::new();
+                for c in &collections {
+                    let count = store.count_documents(Some(&c.name)).await.unwrap_or(0);
+                    data.push(serde_json::json!({
+                        "name": c.name,
+                        "path": c.path,
+                        "documents": count,
+                    }));
+                }
                 println!("{}", serde_json::to_string_pretty(&data)?);
             } else {
                 println!("Collections:\n");
                 for col in collections {
-                    let doc_count = store.count_documents(Some(&col.name)).unwrap_or(0);
+                    let doc_count = store.count_documents(Some(&col.name)).await.unwrap_or(0);
                     println!("  qfs://{}/  ({} files)", col.name, doc_count);
                 }
             }
@@ -420,14 +463,16 @@ fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
             let (collection_name, path_prefix) = parse_ls_path(path_arg);
 
             // Verify collection exists
-            if store.get_collection(&collection_name).is_err() {
+            if store.get_collection(&collection_name).await.is_err() {
                 anyhow::bail!(
                     "Collection not found: {}\nRun 'qfs ls' to see available collections.",
                     collection_name
                 );
             }
 
-            let files = store.list_files(&collection_name, path_prefix.as_deref())?;
+            let files = store
+                .list_files(&collection_name, path_prefix.as_deref())
+                .await?;
 
             if files.is_empty() {
                 if let Some(prefix) = path_prefix {
@@ -468,16 +513,16 @@ fn cmd_ls(db_path: &Path, path: Option<&str>, format: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_index(db_path: &Path, name: Option<&str>) -> Result<()> {
-    let store = Store::open(db_path)?;
+async fn cmd_index(db_path: &Path, name: Option<&str>) -> Result<()> {
+    let store = Store::open(db_path).await?;
     let indexer = Indexer::new(&store);
 
     let stats = if let Some(collection_name) = name {
         println!("Indexing collection '{}'...", collection_name);
-        indexer.index_collection(collection_name)?
+        indexer.index_collection(collection_name).await?
     } else {
         println!("Indexing all collections...");
-        indexer.index_all()?
+        indexer.index_all().await?
     };
 
     println!(
@@ -492,29 +537,228 @@ fn cmd_index(db_path: &Path, name: Option<&str>) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_search(
+async fn cmd_embed(
+    db_path: &Path,
+    collection: Option<&str>,
+    force: bool,
+    model: &str,
+    chunk_size: usize,
+    overlap: usize,
+) -> Result<()> {
+    use qfs_embed::{chunk_text, embedding_to_bytes, EmbedConfig, Embedder, Model};
+    use std::io::Write;
+
+    let store = Store::open(db_path).await?;
+
+    // Initialize embedder (downloads model if needed)
+    println!("Initializing embedding model...");
+    let model: Model = model.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let config = EmbedConfig {
+        model,
+        show_download_progress: true,
+        ..Default::default()
+    };
+    let embedder = Embedder::with_config(config).map_err(|e| anyhow::anyhow!("{}", e))?;
+    println!(
+        "Using model: {} ({} dimensions)",
+        embedder.model_name(),
+        embedder.dimensions()
+    );
+
+    // Get documents to embed
+    let documents = if let Some(coll) = collection {
+        println!("Embedding collection '{}'...", coll);
+        store.list_documents(coll).await?
+    } else {
+        println!("Embedding all collections...");
+        store.list_all_documents().await?
+    };
+
+    let total = documents.len();
+    if total == 0 {
+        println!("No documents to embed.");
+        return Ok(());
+    }
+
+    let mut embedded = 0;
+    let mut skipped = 0;
+    let mut errors = 0;
+    let mut total_chunks = 0;
+
+    for (i, doc) in documents.iter().enumerate() {
+        // Skip if already has embeddings (unless force)
+        if !force && store.has_embeddings(&doc.hash).await? {
+            skipped += 1;
+            continue;
+        }
+
+        // Delete existing embeddings if force
+        if force {
+            store.delete_embeddings(&doc.hash).await?;
+        }
+
+        // Get document content
+        let content = match store.get_content(&doc.hash).await {
+            Ok(c) => c,
+            Err(e) => {
+                errors += 1;
+                tracing::warn!("Failed to get content for {}: {}", doc.path, e);
+                continue;
+            }
+        };
+
+        let text = match String::from_utf8(content.data) {
+            Ok(t) => t,
+            Err(_) => {
+                skipped += 1; // Binary file
+                continue;
+            }
+        };
+
+        if text.trim().is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Chunk the document
+        let chunks = chunk_text(&text, chunk_size, overlap);
+        if chunks.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Generate embeddings
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let embeddings = match embedder.embed(&texts) {
+            Ok(e) => e,
+            Err(e) => {
+                errors += 1;
+                tracing::warn!("Failed to embed {}: {}", doc.path, e);
+                continue;
+            }
+        };
+
+        // Store embeddings
+        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+            let bytes = embedding_to_bytes(embedding);
+            store
+                .insert_embedding(
+                    &doc.hash,
+                    chunk.index as i32,
+                    chunk.char_offset as i32,
+                    embedder.model_name(),
+                    &bytes,
+                )
+                .await?;
+        }
+
+        embedded += 1;
+        total_chunks += chunks.len();
+
+        // Progress update
+        print!(
+            "\rProgress: {}/{} documents ({} embedded, {} skipped)",
+            i + 1,
+            total,
+            embedded,
+            skipped
+        );
+        std::io::stdout().flush().ok();
+    }
+    println!();
+
+    // Ensure vector index exists for efficient search
+    if embedded > 0 {
+        print!("Creating vector index...");
+        std::io::stdout().flush().ok();
+        match store.ensure_vector_index().await {
+            Ok(true) => println!(" done"),
+            Ok(false) => println!(" skipped (already exists or no embeddings)"),
+            Err(e) => println!(" warning: {}", e),
+        }
+    }
+
+    println!("\nEmbedding complete:");
+    println!("  Documents embedded: {}", embedded);
+    println!("  Documents skipped: {}", skipped);
+    println!("  Total chunks: {}", total_chunks);
+    println!("  Errors: {}", errors);
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_search(
     db_path: &Path,
     query: &str,
     mode: &str,
     limit: usize,
     min_score: f64,
     collection: Option<&str>,
+    from_date: Option<&str>,
+    to_date: Option<&str>,
     include_binary: bool,
     format: &str,
 ) -> Result<()> {
-    let store = Store::open(db_path)?;
+    let store = Store::open(db_path).await?;
 
     let search_mode: SearchMode = mode.parse()?;
     let options = SearchOptions {
-        mode: search_mode,
+        mode: search_mode.clone(),
         limit,
         min_score,
         collection: collection.map(String::from),
         include_binary,
+        from_date: from_date.map(String::from),
+        to_date: to_date.map(String::from),
     };
 
     let searcher = qfs::search::Searcher::new(&store);
-    let results = searcher.search(query, options)?;
+
+    // For vector/hybrid modes, we need to embed the query first
+    let results = match search_mode {
+        SearchMode::Bm25 => searcher.search(query, options).await?,
+        SearchMode::Vector => {
+            // Check if embeddings exist
+            let embed_count = store.count_embeddings(collection).await?;
+            if embed_count == 0 {
+                anyhow::bail!(
+                    "No embeddings found. Run 'qfs embed' first to enable vector search."
+                );
+            }
+
+            // Initialize embedder and embed query
+            let embedder =
+                qfs_embed::Embedder::new().map_err(|e| anyhow::anyhow!("Embedder error: {}", e))?;
+            let query_embedding = embedder
+                .embed_one(query)
+                .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+
+            searcher
+                .search_vector_with_embedding(&query_embedding, &options)
+                .await?
+        }
+        SearchMode::Hybrid => {
+            // Check if embeddings exist
+            let embed_count = store.count_embeddings(collection).await?;
+            if embed_count == 0 {
+                anyhow::bail!(
+                    "No embeddings found. Run 'qfs embed' first to enable hybrid search."
+                );
+            }
+
+            // Initialize embedder and embed query
+            let embedder =
+                qfs_embed::Embedder::new().map_err(|e| anyhow::anyhow!("Embedder error: {}", e))?;
+            let query_embedding = embedder
+                .embed_one(query)
+                .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+
+            searcher
+                .search_hybrid_with_embedding(query, &query_embedding, &options)
+                .await?
+        }
+    };
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&results)?);
@@ -537,7 +781,7 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_get(
+async fn cmd_get(
     db_path: &Path,
     path: &str,
     from_line: Option<usize>,
@@ -545,7 +789,7 @@ fn cmd_get(
     line_numbers: bool,
     format: &str,
 ) -> Result<()> {
-    let store = Store::open(db_path)?;
+    let store = Store::open(db_path).await?;
 
     // Parse :linenum suffix if --from not provided
     let (clean_path, suffix_line) = qfs::parse_path_with_line(path);
@@ -553,18 +797,18 @@ fn cmd_get(
 
     // Check if input is a docid
     let doc = if qfs::store::is_docid(clean_path) {
-        store.get_document_by_docid(clean_path)?
+        store.get_document_by_docid(clean_path).await?
     } else {
         // Parse path as collection/relative_path
         let parts: Vec<&str> = clean_path.splitn(2, '/').collect();
         if parts.len() != 2 {
             anyhow::bail!("Path must be in format 'collection/relative_path' or docid");
         }
-        store.get_document(parts[0], parts[1])?
+        store.get_document(parts[0], parts[1]).await?
     };
 
     // Get content
-    let content = store.get_content(&doc.hash)?;
+    let content = store.get_content(&doc.hash).await?;
     let text = String::from_utf8(content.data.clone())
         .map_err(|_| anyhow::anyhow!("Content is not valid UTF-8"))?;
 
@@ -600,15 +844,15 @@ fn cmd_get(
     Ok(())
 }
 
-fn cmd_multi_get(
+async fn cmd_multi_get(
     db_path: &Path,
     pattern: &str,
     max_bytes: usize,
     max_lines: Option<usize>,
     format: &str,
 ) -> Result<()> {
-    let store = Store::open(db_path)?;
-    let results = store.multi_get(pattern, max_bytes, max_lines)?;
+    let store = Store::open(db_path).await?;
+    let results = store.multi_get(pattern, max_bytes, max_lines).await?;
 
     if results.is_empty() {
         println!("No files matched pattern: {}", pattern);
@@ -637,36 +881,60 @@ fn cmd_multi_get(
     Ok(())
 }
 
-fn cmd_status(db_path: &Path) -> Result<()> {
+async fn cmd_status(db_path: &Path) -> Result<()> {
     if !db_path.exists() {
         println!("Database not initialized. Run 'qfs init' first.");
         return Ok(());
     }
 
-    let store = Store::open(db_path)?;
-    let collections = store.list_collections()?;
-    let total_docs = store.count_documents(None)?;
+    let store = Store::open(db_path).await?;
+    let collections = store.list_collections().await?;
+    let total_docs = store.count_documents(None).await?;
+    let docs_with_embeddings = store.count_embeddings(None).await?;
 
     println!("QFS Status");
     println!("===========");
     println!("Database: {}", db_path.display());
     println!("Collections: {}", collections.len());
     println!("Total documents: {}", total_docs);
+    println!(
+        "Documents with embeddings: {}/{}",
+        docs_with_embeddings, total_docs
+    );
+
+    if docs_with_embeddings < total_docs && total_docs > 0 {
+        println!("  (run 'qfs embed' to generate missing embeddings)");
+    }
 
     if !collections.is_empty() {
         println!("\nPer-collection stats:");
-        for col in collections {
-            let count = store.count_documents(Some(&col.name)).unwrap_or(0);
-            println!("  {}: {} documents", col.name, count);
+        for col in &collections {
+            let count = store.count_documents(Some(&col.name)).await.unwrap_or(0);
+            let embedded = store.count_embeddings(Some(&col.name)).await.unwrap_or(0);
+            println!(
+                "  {}: {} documents ({} embedded)",
+                col.name, count, embedded
+            );
         }
     }
+
+    // Check vector index status
+    let has_index = store.has_vector_index().await;
+    println!(
+        "\nVector search: {}",
+        if has_index {
+            "ready"
+        } else {
+            "not indexed"
+        }
+    );
 
     Ok(())
 }
 
-fn cmd_serve(db_path: &Path) -> Result<()> {
-    let server = mcp::McpServer::new(db_path)?;
-    Ok(server.run()?)
+async fn cmd_serve(db_path: &Path) -> Result<()> {
+    let server = mcp::McpServer::new(db_path).await?;
+    Ok(server.run().await?)
 }
 
 /// Parse context path into (collection, path_prefix)
@@ -695,13 +963,15 @@ fn parse_context_path(path: &str) -> (Option<String>, String) {
     }
 }
 
-fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
-    let store = Store::open(db_path)?;
+async fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
+    let store = Store::open(db_path).await?;
 
     match action {
         ContextAction::Add { path, description } => {
             let (collection, path_prefix) = parse_context_path(&path);
-            store.set_context(collection.as_deref(), &path_prefix, &description)?;
+            store
+                .set_context(collection.as_deref(), &path_prefix, &description)
+                .await?;
 
             if let Some(coll) = collection {
                 println!("Added context for {}/{}", coll, path_prefix);
@@ -711,7 +981,7 @@ fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
         }
 
         ContextAction::List => {
-            let contexts = store.list_contexts()?;
+            let contexts = store.list_contexts().await?;
 
             if contexts.is_empty() {
                 println!("No contexts defined. Use 'qfs context add' to add context.");
@@ -736,14 +1006,14 @@ fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
         }
 
         ContextAction::Check => {
-            let without_context = store.get_collections_without_context()?;
+            let without_context = store.get_collections_without_context().await?;
 
             if without_context.is_empty() {
                 println!("All collections have context defined.");
             } else {
                 println!("Collections without context:\n");
                 for coll in without_context {
-                    let doc_count = store.count_documents(Some(&coll.name)).unwrap_or(0);
+                    let doc_count = store.count_documents(Some(&coll.name)).await.unwrap_or(0);
                     println!("  {} ({} files)", coll.name, doc_count);
                     println!(
                         "    Suggested: qfs context add {} \"Description here\"",
@@ -755,7 +1025,10 @@ fn cmd_context(db_path: &Path, action: ContextAction) -> Result<()> {
 
         ContextAction::Rm { path } => {
             let (collection, path_prefix) = parse_context_path(&path);
-            if store.remove_context(collection.as_deref(), &path_prefix)? {
+            if store
+                .remove_context(collection.as_deref(), &path_prefix)
+                .await?
+            {
                 println!("Removed context for {}", path);
             } else {
                 println!("No context found for {}", path);

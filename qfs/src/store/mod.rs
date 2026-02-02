@@ -6,13 +6,23 @@
 //! - Collections (indexed directories)
 //! - FTS5 index (full-text search)
 //! - Embeddings (optional vector storage)
+//!
+//! ## Vector Search
+//!
+//! The store supports two vector search modes:
+//! - **Native** (via libsql): Uses `vector_top_k()` with an ANN index for efficient KNN search.
+//!   Requires embeddings to be stored in libsql's vector format.
+//! - **Legacy** (fallback): Loads all embeddings into memory and calculates cosine similarity.
+//!   Works with embeddings stored as raw BLOB data.
+//!
+//! The search automatically falls back to legacy mode if native search is not available.
 
 mod schema;
 
 use crate::error::{Error, Result};
 use chrono::Utc;
 use glob::Pattern;
-use rusqlite::{params, Connection};
+use libsql::{params, Builder, Connection, Database};
 use std::path::{Path, PathBuf};
 
 pub use schema::SCHEMA_VERSION;
@@ -143,45 +153,49 @@ pub fn is_docid(input: &str) -> bool {
 
 /// The main database store
 pub struct Store {
+    #[allow(dead_code)]
+    db: Database,
     conn: Connection,
     path: PathBuf,
 }
 
 impl Store {
     /// Open or create a database at the given path
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+    pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
 
         // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path_buf.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(&path)?;
+        let db = Builder::new_local(&path_buf).build().await?;
+        let conn = db.connect()?;
 
         // Enable WAL mode for better concurrent access
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.query("PRAGMA journal_mode=WAL;", ()).await?;
 
-        let mut store = Store { conn, path };
-        store.ensure_schema()?;
+        schema::ensure_schema(&conn).await?;
 
-        Ok(store)
+        Ok(Self {
+            db,
+            conn,
+            path: path_buf,
+        })
     }
 
     /// Open an in-memory database (for testing)
-    pub fn open_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let mut store = Store {
+    pub async fn open_memory() -> Result<Self> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+
+        schema::ensure_schema(&conn).await?;
+
+        Ok(Self {
+            db,
             conn,
             path: PathBuf::from(":memory:"),
-        };
-        store.ensure_schema()?;
-        Ok(store)
-    }
-
-    /// Ensure the database schema is up to date
-    fn ensure_schema(&mut self) -> Result<()> {
-        schema::ensure_schema(&self.conn)
+        })
     }
 
     /// Get the database path
@@ -194,12 +208,13 @@ impl Store {
     // -------------------------------------------------------------------------
 
     /// Add a new collection
-    pub fn add_collection(&self, name: &str, path: &str, patterns: &[&str]) -> Result<()> {
+    pub async fn add_collection(&self, name: &str, path: &str, patterns: &[&str]) -> Result<()> {
         self.add_collection_full(name, path, patterns, &[], None, false)
+            .await
     }
 
     /// Add a collection with all options
-    pub fn add_collection_full(
+    pub async fn add_collection_full(
         &self,
         name: &str,
         path: &str,
@@ -212,89 +227,101 @@ impl Store {
         let patterns_json = serde_json::to_string(&patterns)?;
         let exclude_json = serde_json::to_string(&exclude)?;
 
-        self.conn.execute(
-            "INSERT OR REPLACE INTO collections
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO collections
              (name, path, patterns, exclude, context, embeddings_enabled, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![
-                name,
-                path,
-                patterns_json,
-                exclude_json,
-                context,
-                embeddings_enabled,
-                now
-            ],
-        )?;
+                params![
+                    name,
+                    path,
+                    patterns_json,
+                    exclude_json,
+                    context,
+                    embeddings_enabled,
+                    now
+                ],
+            )
+            .await?;
 
         Ok(())
     }
 
     /// Get a collection by name
-    pub fn get_collection(&self, name: &str) -> Result<Collection> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, path, patterns, exclude, context, embeddings_enabled, created_at, updated_at
-             FROM collections WHERE name = ?1"
-        )?;
+    pub async fn get_collection(&self, name: &str) -> Result<Collection> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT name, path, patterns, exclude, context, embeddings_enabled, created_at, updated_at
+             FROM collections WHERE name = ?1",
+                params![name],
+            )
+            .await?;
 
-        let collection = stmt
-            .query_row([name], |row| {
-                let patterns_json: String = row.get(2)?;
-                let exclude_json: String = row.get(3)?;
+        if let Some(row) = rows.next().await? {
+            let patterns_json: String = row.get(2)?;
+            let exclude_json: String = row.get(3)?;
 
-                Ok(Collection {
-                    name: row.get(0)?,
-                    path: row.get(1)?,
-                    patterns: serde_json::from_str(&patterns_json).unwrap_or_default(),
-                    exclude: serde_json::from_str(&exclude_json).unwrap_or_default(),
-                    context: row.get(4)?,
-                    embeddings_enabled: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
-                })
+            Ok(Collection {
+                name: row.get(0)?,
+                path: row.get(1)?,
+                patterns: serde_json::from_str(&patterns_json).unwrap_or_default(),
+                exclude: serde_json::from_str(&exclude_json).unwrap_or_default(),
+                context: row.get(4)?,
+                embeddings_enabled: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
-            .map_err(|_| Error::CollectionNotFound(name.to_string()))?;
-
-        Ok(collection)
+        } else {
+            Err(Error::CollectionNotFound(name.to_string()))
+        }
     }
 
     /// List all collections
-    pub fn list_collections(&self) -> Result<Vec<Collection>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, path, patterns, exclude, context, embeddings_enabled, created_at, updated_at
-             FROM collections ORDER BY name"
-        )?;
+    pub async fn list_collections(&self) -> Result<Vec<Collection>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT name, path, patterns, exclude, context, embeddings_enabled, created_at, updated_at
+             FROM collections ORDER BY name",
+                (),
+            )
+            .await?;
 
-        let collections = stmt
-            .query_map([], |row| {
-                let patterns_json: String = row.get(2)?;
-                let exclude_json: String = row.get(3)?;
+        let mut collections = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let patterns_json: String = row.get(2)?;
+            let exclude_json: String = row.get(3)?;
 
-                Ok(Collection {
-                    name: row.get(0)?,
-                    path: row.get(1)?,
-                    patterns: serde_json::from_str(&patterns_json).unwrap_or_default(),
-                    exclude: serde_json::from_str(&exclude_json).unwrap_or_default(),
-                    context: row.get(4)?,
-                    embeddings_enabled: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            collections.push(Collection {
+                name: row.get(0)?,
+                path: row.get(1)?,
+                patterns: serde_json::from_str(&patterns_json).unwrap_or_default(),
+                exclude: serde_json::from_str(&exclude_json).unwrap_or_default(),
+                context: row.get(4)?,
+                embeddings_enabled: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            });
+        }
 
         Ok(collections)
     }
 
     /// Remove a collection and its documents
-    pub fn remove_collection(&self, name: &str) -> Result<()> {
+    pub async fn remove_collection(&self, name: &str) -> Result<()> {
         // Delete documents first
         self.conn
-            .execute("DELETE FROM documents WHERE collection = ?1", [name])?;
+            .execute(
+                "DELETE FROM documents WHERE collection = ?1",
+                params![name],
+            )
+            .await?;
 
         // Delete the collection
         self.conn
-            .execute("DELETE FROM collections WHERE name = ?1", [name])?;
+            .execute("DELETE FROM collections WHERE name = ?1", params![name])
+            .await?;
 
         Ok(())
     }
@@ -304,50 +331,63 @@ impl Store {
     // -------------------------------------------------------------------------
 
     /// Check if content exists by hash
-    pub fn content_exists(&self, hash: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM content WHERE hash = ?1",
-            [hash],
-            |row| row.get(0),
-        )?;
+    pub async fn content_exists(&self, hash: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM content WHERE hash = ?1",
+                params![hash],
+            )
+            .await?;
+
+        let count: i64 = if let Some(row) = rows.next().await? {
+            row.get(0)?
+        } else {
+            0
+        };
+
         Ok(count > 0)
     }
 
     /// Insert content (if not exists)
-    pub fn insert_content(&self, hash: &str, data: &[u8], content_type: &str) -> Result<()> {
-        if self.content_exists(hash)? {
+    pub async fn insert_content(&self, hash: &str, data: &[u8], content_type: &str) -> Result<()> {
+        if self.content_exists(hash).await? {
             return Ok(());
         }
 
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT INTO content (hash, content, content_type, size, created_at)
+        self.conn
+            .execute(
+                "INSERT INTO content (hash, content, content_type, size, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![hash, data, content_type, data.len() as i64, now],
-        )?;
+                params![hash, data, content_type, data.len() as i64, now],
+            )
+            .await?;
 
         Ok(())
     }
 
     /// Get content by hash
-    pub fn get_content(&self, hash: &str) -> Result<Content> {
-        let mut stmt = self.conn.prepare(
-            "SELECT hash, content, content_type, size, created_at FROM content WHERE hash = ?1",
-        )?;
+    pub async fn get_content(&self, hash: &str) -> Result<Content> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT hash, content, content_type, size, created_at FROM content WHERE hash = ?1",
+                params![hash],
+            )
+            .await?;
 
-        let content = stmt
-            .query_row([hash], |row| {
-                Ok(Content {
-                    hash: row.get(0)?,
-                    data: row.get(1)?,
-                    content_type: row.get(2)?,
-                    size: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
+        if let Some(row) = rows.next().await? {
+            Ok(Content {
+                hash: row.get(0)?,
+                data: row.get(1)?,
+                content_type: row.get(2)?,
+                size: row.get(3)?,
+                created_at: row.get(4)?,
             })
-            .map_err(|_| Error::DocumentNotFound(hash.to_string()))?;
-
-        Ok(content)
+        } else {
+            Err(Error::DocumentNotFound(hash.to_string()))
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -355,7 +395,7 @@ impl Store {
     // -------------------------------------------------------------------------
 
     /// Upsert a document
-    pub fn upsert_document(
+    pub async fn upsert_document(
         &self,
         collection: &str,
         path: &str,
@@ -368,8 +408,9 @@ impl Store {
         let filepath = format!("{}/{}", collection, path);
 
         // Insert or update the document
-        self.conn.execute(
-            "INSERT INTO documents (collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active)
+        self.conn
+            .execute(
+                "INSERT INTO documents (collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, 1)
              ON CONFLICT(collection, path) DO UPDATE SET
                title = excluded.title,
@@ -378,145 +419,52 @@ impl Store {
                modified_at = excluded.modified_at,
                indexed_at = excluded.indexed_at,
                active = 1",
-            params![collection, path, title, hash, file_type, now],
-        )?;
+                params![collection, path, title, hash, file_type, now],
+            )
+            .await?;
 
         // Get the document ID
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM documents WHERE collection = ?1 AND path = ?2",
-            [collection, path],
-            |row| row.get(0),
-        )?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM documents WHERE collection = ?1 AND path = ?2",
+                params![collection, path],
+            )
+            .await?;
+
+        let id: i64 = if let Some(row) = rows.next().await? {
+            row.get(0)?
+        } else {
+            return Err(Error::DocumentNotFound(format!("{}/{}", collection, path)));
+        };
 
         // Update FTS index (FTS5 doesn't support ON CONFLICT, so delete first)
         self.conn
-            .execute("DELETE FROM documents_fts WHERE rowid = ?1", [id])?;
-        self.conn.execute(
-            "INSERT INTO documents_fts (rowid, filepath, title, body)
+            .execute("DELETE FROM documents_fts WHERE rowid = ?1", params![id])
+            .await?;
+        self.conn
+            .execute(
+                "INSERT INTO documents_fts (rowid, filepath, title, body)
              VALUES (?1, ?2, ?3, ?4)",
-            params![id, filepath, title.unwrap_or(""), body],
-        )?;
+                params![id, filepath, title.unwrap_or(""), body],
+            )
+            .await?;
 
         Ok(id)
     }
 
     /// Get a document by collection and path
-    pub fn get_document(&self, collection: &str, path: &str) -> Result<Document> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
-             FROM documents WHERE collection = ?1 AND path = ?2 AND active = 1"
-        )?;
+    pub async fn get_document(&self, collection: &str, path: &str) -> Result<Document> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
+             FROM documents WHERE collection = ?1 AND path = ?2 AND active = 1",
+                params![collection, path],
+            )
+            .await?;
 
-        let doc = stmt
-            .query_row([collection, path], |row| {
-                Ok(Document {
-                    id: row.get(0)?,
-                    collection: row.get(1)?,
-                    path: row.get(2)?,
-                    title: row.get(3)?,
-                    hash: row.get(4)?,
-                    file_type: row.get(5)?,
-                    created_at: row.get(6)?,
-                    modified_at: row.get(7)?,
-                    indexed_at: row.get(8)?,
-                    active: row.get(9)?,
-                })
-            })
-            .map_err(|_| Error::DocumentNotFound(format!("{}/{}", collection, path)))?;
-
-        Ok(doc)
-    }
-
-    /// Get a document by ID
-    pub fn get_document_by_id(&self, id: i64) -> Result<Document> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
-             FROM documents WHERE id = ?1"
-        )?;
-
-        let doc = stmt
-            .query_row([id], |row| {
-                Ok(Document {
-                    id: row.get(0)?,
-                    collection: row.get(1)?,
-                    path: row.get(2)?,
-                    title: row.get(3)?,
-                    hash: row.get(4)?,
-                    file_type: row.get(5)?,
-                    created_at: row.get(6)?,
-                    modified_at: row.get(7)?,
-                    indexed_at: row.get(8)?,
-                    active: row.get(9)?,
-                })
-            })
-            .map_err(|_| Error::DocumentNotFound(id.to_string()))?;
-
-        Ok(doc)
-    }
-
-    /// Find a document by its short docid (first 6 characters of hash).
-    /// Returns the first matching document if found.
-    pub fn get_document_by_docid(&self, docid: &str) -> Result<Document> {
-        let short_hash = normalize_docid(docid);
-
-        if short_hash.len() < 6 {
-            return Err(Error::InvalidQuery(
-                "Docid must be at least 6 characters".to_string(),
-            ));
-        }
-
-        let pattern = format!("{}%", short_hash);
-
-        let mut stmt = self.conn.prepare(
-            "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
-             FROM documents WHERE hash LIKE ?1 AND active = 1 LIMIT 1",
-        )?;
-
-        let doc = stmt
-            .query_row([&pattern], |row| {
-                Ok(Document {
-                    id: row.get(0)?,
-                    collection: row.get(1)?,
-                    path: row.get(2)?,
-                    title: row.get(3)?,
-                    hash: row.get(4)?,
-                    file_type: row.get(5)?,
-                    created_at: row.get(6)?,
-                    modified_at: row.get(7)?,
-                    indexed_at: row.get(8)?,
-                    active: row.get(9)?,
-                })
-            })
-            .map_err(|_| Error::DocumentNotFound(format!("docid:{}", short_hash)))?;
-
-        Ok(doc)
-    }
-
-    /// Mark a document as inactive (soft delete)
-    pub fn deactivate_document(&self, collection: &str, path: &str) -> Result<()> {
-        // First get the document ID to remove from FTS
-        if let Ok(doc) = self.get_document(collection, path) {
-            // Remove from FTS index
-            self.conn
-                .execute("DELETE FROM documents_fts WHERE rowid = ?1", [doc.id])?;
-        }
-
-        self.conn.execute(
-            "UPDATE documents SET active = 0 WHERE collection = ?1 AND path = ?2",
-            [collection, path],
-        )?;
-        Ok(())
-    }
-
-    /// List all documents in a collection
-    pub fn list_documents(&self, collection: &str) -> Result<Vec<Document>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
-             FROM documents WHERE collection = ?1 AND active = 1
-             ORDER BY path"
-        )?;
-
-        let docs = stmt.query_map([collection], |row| {
+        if let Some(row) = rows.next().await? {
             Ok(Document {
                 id: row.get(0)?,
                 collection: row.get(1)?,
@@ -529,75 +477,252 @@ impl Store {
                 indexed_at: row.get(8)?,
                 active: row.get(9)?,
             })
-        })?;
-
-        let mut result = Vec::new();
-        for doc in docs {
-            result.push(doc?);
+        } else {
+            Err(Error::DocumentNotFound(format!("{}/{}", collection, path)))
         }
-        Ok(result)
+    }
+
+    /// Get a document by ID
+    pub async fn get_document_by_id(&self, id: i64) -> Result<Document> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
+             FROM documents WHERE id = ?1",
+                params![id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(Document {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                path: row.get(2)?,
+                title: row.get(3)?,
+                hash: row.get(4)?,
+                file_type: row.get(5)?,
+                created_at: row.get(6)?,
+                modified_at: row.get(7)?,
+                indexed_at: row.get(8)?,
+                active: row.get(9)?,
+            })
+        } else {
+            Err(Error::DocumentNotFound(id.to_string()))
+        }
+    }
+
+    /// Find a document by its short docid (first 6 characters of hash).
+    /// Returns the first matching document if found.
+    pub async fn get_document_by_docid(&self, docid: &str) -> Result<Document> {
+        let short_hash = normalize_docid(docid);
+
+        if short_hash.len() < 6 {
+            return Err(Error::InvalidQuery(
+                "Docid must be at least 6 characters".to_string(),
+            ));
+        }
+
+        let pattern = format!("{}%", short_hash);
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
+             FROM documents WHERE hash LIKE ?1 AND active = 1 LIMIT 1",
+                params![pattern],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(Document {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                path: row.get(2)?,
+                title: row.get(3)?,
+                hash: row.get(4)?,
+                file_type: row.get(5)?,
+                created_at: row.get(6)?,
+                modified_at: row.get(7)?,
+                indexed_at: row.get(8)?,
+                active: row.get(9)?,
+            })
+        } else {
+            Err(Error::DocumentNotFound(format!("docid:{}", short_hash)))
+        }
+    }
+
+    /// Mark a document as inactive (soft delete)
+    pub async fn deactivate_document(&self, collection: &str, path: &str) -> Result<()> {
+        // First get the document ID to remove from FTS
+        if let Ok(doc) = self.get_document(collection, path).await {
+            // Remove from FTS index
+            self.conn
+                .execute(
+                    "DELETE FROM documents_fts WHERE rowid = ?1",
+                    params![doc.id],
+                )
+                .await?;
+        }
+
+        self.conn
+            .execute(
+                "UPDATE documents SET active = 0 WHERE collection = ?1 AND path = ?2",
+                params![collection, path],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// List all documents in a collection
+    pub async fn list_documents(&self, collection: &str) -> Result<Vec<Document>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
+             FROM documents WHERE collection = ?1 AND active = 1
+             ORDER BY path",
+                params![collection],
+            )
+            .await?;
+
+        let mut docs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            docs.push(Document {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                path: row.get(2)?,
+                title: row.get(3)?,
+                hash: row.get(4)?,
+                file_type: row.get(5)?,
+                created_at: row.get(6)?,
+                modified_at: row.get(7)?,
+                indexed_at: row.get(8)?,
+                active: row.get(9)?,
+            });
+        }
+
+        Ok(docs)
+    }
+
+    /// List all active documents across all collections
+    pub async fn list_all_documents(&self) -> Result<Vec<Document>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, collection, path, title, hash, file_type, created_at, modified_at, indexed_at, active
+             FROM documents WHERE active = 1
+             ORDER BY collection, path",
+                (),
+            )
+            .await?;
+
+        let mut docs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            docs.push(Document {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                path: row.get(2)?,
+                title: row.get(3)?,
+                hash: row.get(4)?,
+                file_type: row.get(5)?,
+                created_at: row.get(6)?,
+                modified_at: row.get(7)?,
+                indexed_at: row.get(8)?,
+                active: row.get(9)?,
+            });
+        }
+
+        Ok(docs)
     }
 
     /// Count documents in a collection
-    pub fn count_documents(&self, collection: Option<&str>) -> Result<i64> {
+    pub async fn count_documents(&self, collection: Option<&str>) -> Result<i64> {
         let count: i64 = if let Some(coll) = collection {
-            self.conn.query_row(
-                "SELECT COUNT(*) FROM documents WHERE collection = ?1 AND active = 1",
-                [coll],
-                |row| row.get(0),
-            )?
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM documents WHERE collection = ?1 AND active = 1",
+                    params![coll],
+                )
+                .await?;
+
+            if let Some(row) = rows.next().await? {
+                row.get(0)?
+            } else {
+                0
+            }
         } else {
-            self.conn.query_row(
-                "SELECT COUNT(*) FROM documents WHERE active = 1",
-                [],
-                |row| row.get(0),
-            )?
+            let mut rows = self
+                .conn
+                .query("SELECT COUNT(*) FROM documents WHERE active = 1", ())
+                .await?;
+
+            if let Some(row) = rows.next().await? {
+                row.get(0)?
+            } else {
+                0
+            }
         };
         Ok(count)
     }
 
     /// List files in a collection, optionally filtered by path prefix.
-    pub fn list_files(
+    pub async fn list_files(
         &self,
         collection: &str,
         path_prefix: Option<&str>,
     ) -> Result<Vec<FileEntry>> {
-        let sql = if path_prefix.is_some() {
-            r#"
-            SELECT d.collection, d.path, d.title, LENGTH(c.content) as size, d.modified_at
-            FROM documents d
-            JOIN content c ON c.hash = d.hash
-            WHERE d.collection = ?1 AND d.path LIKE ?2 AND d.active = 1
-            ORDER BY d.path
-            "#
-        } else {
-            r#"
-            SELECT d.collection, d.path, d.title, LENGTH(c.content) as size, d.modified_at
-            FROM documents d
-            JOIN content c ON c.hash = d.hash
-            WHERE d.collection = ?1 AND d.active = 1
-            ORDER BY d.path
-            "#
-        };
-
-        let mut stmt = self.conn.prepare(sql)?;
         let mut entries = Vec::new();
 
-        let mut rows = if let Some(prefix) = path_prefix {
+        if let Some(prefix) = path_prefix {
             let pattern = format!("{}%", prefix);
-            stmt.query(params![collection, pattern])?
-        } else {
-            stmt.query(params![collection])?
-        };
+            let mut rows = self
+                .conn
+                .query(
+                    r#"
+                SELECT d.collection, d.path, d.title, LENGTH(c.content) as size, d.modified_at
+                FROM documents d
+                JOIN content c ON c.hash = d.hash
+                WHERE d.collection = ?1 AND d.path LIKE ?2 AND d.active = 1
+                ORDER BY d.path
+                "#,
+                    params![collection, pattern],
+                )
+                .await?;
 
-        while let Some(row) = rows.next()? {
-            entries.push(FileEntry {
-                collection: row.get(0)?,
-                path: row.get(1)?,
-                title: row.get(2)?,
-                size: row.get(3)?,
-                modified_at: row.get(4)?,
-            });
+            while let Some(row) = rows.next().await? {
+                entries.push(FileEntry {
+                    collection: row.get(0)?,
+                    path: row.get(1)?,
+                    title: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_at: row.get(4)?,
+                });
+            }
+        } else {
+            let mut rows = self
+                .conn
+                .query(
+                    r#"
+                SELECT d.collection, d.path, d.title, LENGTH(c.content) as size, d.modified_at
+                FROM documents d
+                JOIN content c ON c.hash = d.hash
+                WHERE d.collection = ?1 AND d.active = 1
+                ORDER BY d.path
+                "#,
+                    params![collection],
+                )
+                .await?;
+
+            while let Some(row) = rows.next().await? {
+                entries.push(FileEntry {
+                    collection: row.get(0)?,
+                    path: row.get(1)?,
+                    title: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_at: row.get(4)?,
+                });
+            }
         }
 
         Ok(entries)
@@ -609,7 +734,7 @@ impl Store {
 
     /// Add or update a context for a path prefix.
     /// Use collection=None for global context.
-    pub fn set_context(
+    pub async fn set_context(
         &self,
         collection: Option<&str>,
         path_prefix: &str,
@@ -624,35 +749,40 @@ impl Store {
             format!("/{}", path_prefix)
         };
 
-        self.conn.execute(
-            "INSERT INTO path_contexts (collection, path_prefix, context, created_at, updated_at)
+        self.conn
+            .execute(
+                "INSERT INTO path_contexts (collection, path_prefix, context, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(collection, path_prefix) DO UPDATE SET
                context = excluded.context,
                updated_at = excluded.updated_at",
-            params![collection, normalized, context, now],
-        )?;
+                params![collection, normalized, context, now],
+            )
+            .await?;
 
         Ok(())
     }
 
     /// Get the global context.
-    pub fn get_global_context(&self) -> Result<Option<String>> {
-        let result: Option<String> = self
+    pub async fn get_global_context(&self) -> Result<Option<String>> {
+        let mut rows = self
             .conn
-            .query_row(
+            .query(
                 "SELECT context FROM path_contexts WHERE collection IS NULL AND path_prefix = '/'",
-                [],
-                |row| row.get(0),
+                (),
             )
-            .ok();
+            .await?;
 
-        Ok(result)
+        if let Some(row) = rows.next().await? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Find the most specific context for a file path.
     /// Uses longest-prefix matching.
-    pub fn find_context_for_path(
+    pub async fn find_context_for_path(
         &self,
         collection: &str,
         file_path: &str,
@@ -665,17 +795,19 @@ impl Store {
         };
 
         // Get all matching contexts for this collection (sorted by prefix length desc)
-        let mut stmt = self.conn.prepare(
-            "SELECT path_prefix, context FROM path_contexts
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT path_prefix, context FROM path_contexts
              WHERE (collection = ?1 OR collection IS NULL)
              ORDER BY
                CASE WHEN collection IS NOT NULL THEN 0 ELSE 1 END,
                LENGTH(path_prefix) DESC",
-        )?;
+                params![collection],
+            )
+            .await?;
 
-        let mut rows = stmt.query([collection])?;
-
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().await? {
             let prefix: String = row.get(0)?;
             let context: String = row.get(1)?;
 
@@ -690,7 +822,7 @@ impl Store {
 
     /// Get all contexts for a file path (global + collection, ordered general to specific).
     /// Used for search results where we want all relevant context.
-    pub fn get_all_contexts_for_path(
+    pub async fn get_all_contexts_for_path(
         &self,
         collection: &str,
         file_path: &str,
@@ -701,18 +833,20 @@ impl Store {
             format!("/{}", file_path)
         };
 
-        let mut stmt = self.conn.prepare(
-            "SELECT path_prefix, context, collection FROM path_contexts
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT path_prefix, context, collection FROM path_contexts
              WHERE (collection = ?1 OR collection IS NULL)
              ORDER BY
                CASE WHEN collection IS NULL THEN 0 ELSE 1 END,
                LENGTH(path_prefix) ASC",
-        )?;
+                params![collection],
+            )
+            .await?;
 
         let mut contexts = Vec::new();
-        let mut rows = stmt.query([collection])?;
-
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().await? {
             let prefix: String = row.get(0)?;
             let context: String = row.get(1)?;
 
@@ -725,19 +859,21 @@ impl Store {
     }
 
     /// List all contexts.
-    pub fn list_contexts(&self) -> Result<Vec<PathContext>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, collection, path_prefix, context, created_at, updated_at
+    pub async fn list_contexts(&self) -> Result<Vec<PathContext>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, collection, path_prefix, context, created_at, updated_at
              FROM path_contexts
              ORDER BY
                CASE WHEN collection IS NULL THEN '' ELSE collection END,
                path_prefix",
-        )?;
+                (),
+            )
+            .await?;
 
         let mut contexts = Vec::new();
-        let mut rows = stmt.query([])?;
-
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().await? {
             contexts.push(PathContext {
                 id: row.get(0)?,
                 collection: row.get(1)?,
@@ -752,32 +888,48 @@ impl Store {
     }
 
     /// Remove a context.
-    pub fn remove_context(&self, collection: Option<&str>, path_prefix: &str) -> Result<bool> {
+    pub async fn remove_context(
+        &self,
+        collection: Option<&str>,
+        path_prefix: &str,
+    ) -> Result<bool> {
         let normalized = if path_prefix.starts_with('/') {
             path_prefix.to_string()
         } else {
             format!("/{}", path_prefix)
         };
 
-        let rows = self.conn.execute(
-            "DELETE FROM path_contexts WHERE collection IS ?1 AND path_prefix = ?2",
-            params![collection, normalized],
-        )?;
+        let rows_affected = self
+            .conn
+            .execute(
+                "DELETE FROM path_contexts WHERE collection IS ?1 AND path_prefix = ?2",
+                params![collection, normalized],
+            )
+            .await?;
 
-        Ok(rows > 0)
+        Ok(rows_affected > 0)
     }
 
     /// Get collections without any context defined.
-    pub fn get_collections_without_context(&self) -> Result<Vec<Collection>> {
-        let all_collections = self.list_collections()?;
+    pub async fn get_collections_without_context(&self) -> Result<Vec<Collection>> {
+        let all_collections = self.list_collections().await?;
 
         let mut without_context = Vec::new();
         for coll in all_collections {
-            let has_context: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM path_contexts WHERE collection = ?1",
-                [&coll.name],
-                |row| row.get(0),
-            )?;
+            let coll_name = coll.name.clone();
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM path_contexts WHERE collection = ?1",
+                    params![coll_name],
+                )
+                .await?;
+
+            let has_context: i64 = if let Some(row) = rows.next().await? {
+                row.get(0)?
+            } else {
+                0
+            };
 
             if has_context == 0 {
                 without_context.push(coll);
@@ -792,12 +944,15 @@ impl Store {
     // -------------------------------------------------------------------------
 
     /// Execute BM25 full-text search
-    pub fn search_bm25(
+    /// Supports optional filtering by collection and date range (modified_at)
+    pub async fn search_bm25(
         &self,
         fts_query: &str,
         collection: Option<&str>,
         limit: usize,
         include_binary: bool,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
     ) -> Result<Vec<SearchResultRow>> {
         let mut results = Vec::new();
 
@@ -805,7 +960,27 @@ impl Store {
             return Ok(results);
         }
 
-        let sql = if collection.is_some() {
+        // Build query dynamically based on filters
+        let mut where_clauses: Vec<String> = vec![
+            "documents_fts MATCH ?1".to_string(),
+            "d.active = 1".to_string(),
+        ];
+        let mut param_idx = 2;
+
+        if collection.is_some() {
+            where_clauses.push(format!("d.collection = ?{}", param_idx));
+            param_idx += 1;
+        }
+        if from_date.is_some() {
+            where_clauses.push(format!("d.modified_at >= ?{}", param_idx));
+            param_idx += 1;
+        }
+        if to_date.is_some() {
+            where_clauses.push(format!("d.modified_at <= ?{}", param_idx));
+            param_idx += 1;
+        }
+
+        let query = format!(
             r#"
             SELECT
                 d.id,
@@ -821,74 +996,54 @@ impl Store {
             FROM documents_fts
             JOIN documents d ON d.id = documents_fts.rowid
             JOIN content c ON c.hash = d.hash
-            WHERE documents_fts MATCH ?1
-              AND d.collection = ?2
-              AND d.active = 1
+            WHERE {}
             ORDER BY bm25_score
-            LIMIT ?3
-            "#
-        } else {
-            r#"
-            SELECT
-                d.id,
-                d.collection,
-                d.path,
-                d.title,
-                d.hash,
-                d.file_type,
-                c.content_type,
-                c.size,
-                bm25(documents_fts) as bm25_score,
-                snippet(documents_fts, 2, '<mark>', '</mark>', '...', 64) as snippet
-            FROM documents_fts
-            JOIN documents d ON d.id = documents_fts.rowid
-            JOIN content c ON c.hash = d.hash
-            WHERE documents_fts MATCH ?1
-              AND d.active = 1
-            ORDER BY bm25_score
-            LIMIT ?2
-            "#
-        };
+            LIMIT ?{}
+            "#,
+            where_clauses.join(" AND "),
+            param_idx
+        );
 
-        let mut stmt = self.conn.prepare(sql)?;
+        // Build params dynamically
+        let mut params: Vec<libsql::Value> = vec![fts_query.into()];
+        if let Some(coll) = collection {
+            params.push(coll.into());
+        }
+        if let Some(from) = from_date {
+            params.push(from.into());
+        }
+        if let Some(to) = to_date {
+            params.push(to.into());
+        }
+        params.push((limit as i64).into());
 
-        // Helper closure to map row to SearchResultRow
-        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<SearchResultRow> {
-            Ok(SearchResultRow {
+        let mut rows = self.conn.query(&query, params).await?;
+
+        while let Some(row) = rows.next().await? {
+            let content_type: String = row.get(6)?;
+
+            // Skip binary files unless requested
+            let is_binary = content_type.starts_with("application/octet")
+                || content_type.starts_with("image/")
+                || content_type.starts_with("audio/")
+                || content_type.starts_with("video/");
+
+            if is_binary && !include_binary {
+                continue;
+            }
+
+            results.push(SearchResultRow {
                 id: row.get(0)?,
                 collection: row.get(1)?,
                 path: row.get(2)?,
                 title: row.get(3)?,
                 hash: row.get(4)?,
                 file_type: row.get(5)?,
-                content_type: row.get(6)?,
+                content_type,
                 size: row.get(7)?,
                 bm25_score: row.get(8)?,
                 snippet: row.get(9)?,
-            })
-        };
-
-        // Execute query with appropriate parameters
-        let mut query_rows = if let Some(coll) = collection {
-            stmt.query(params![fts_query, coll, limit as i64])?
-        } else {
-            stmt.query(params![fts_query, limit as i64])?
-        };
-
-        while let Some(row) = query_rows.next()? {
-            let result = map_row(row)?;
-
-            // Skip binary files unless requested
-            let is_binary = result.content_type.starts_with("application/octet")
-                || result.content_type.starts_with("image/")
-                || result.content_type.starts_with("audio/")
-                || result.content_type.starts_with("video/");
-
-            if is_binary && !include_binary {
-                continue;
-            }
-
-            results.push(result);
+            });
         }
 
         Ok(results)
@@ -908,7 +1063,8 @@ impl Store {
     // -------------------------------------------------------------------------
 
     /// Insert embeddings for a document chunk
-    pub fn insert_embedding(
+    /// Column is F32_BLOB(384) which automatically handles the vector format
+    pub async fn insert_embedding(
         &self,
         hash: &str,
         chunk_index: i32,
@@ -918,26 +1074,31 @@ impl Store {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
 
-        self.conn.execute(
-            "INSERT OR REPLACE INTO embeddings (hash, chunk_index, char_offset, model, embedding, created_at)
+        // F32_BLOB column accepts raw bytes (little-endian f32 array)
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO embeddings (hash, chunk_index, char_offset, model, embedding, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![hash, chunk_index, char_offset, model, embedding, now],
-        )?;
+                params![hash, chunk_index, char_offset, model, embedding, now],
+            )
+            .await?;
 
         Ok(())
     }
 
     /// Get all embeddings for a document hash
-    pub fn get_embeddings(&self, hash: &str) -> Result<Vec<EmbeddingRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT hash, chunk_index, char_offset, model, embedding, created_at
+    pub async fn get_embeddings(&self, hash: &str) -> Result<Vec<EmbeddingRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT hash, chunk_index, char_offset, model, embedding, created_at
              FROM embeddings WHERE hash = ?1 ORDER BY chunk_index",
-        )?;
+                params![hash],
+            )
+            .await?;
 
         let mut results = Vec::new();
-        let mut rows = stmt.query([hash])?;
-
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().await? {
             results.push(EmbeddingRow {
                 hash: row.get(0)?,
                 chunk_index: row.get(1)?,
@@ -952,94 +1113,128 @@ impl Store {
     }
 
     /// Check if embeddings exist for a document hash
-    pub fn has_embeddings(&self, hash: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM embeddings WHERE hash = ?1",
-            [hash],
-            |row| row.get(0),
-        )?;
+    pub async fn has_embeddings(&self, hash: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM embeddings WHERE hash = ?1",
+                params![hash],
+            )
+            .await?;
+
+        let count: i64 = if let Some(row) = rows.next().await? {
+            row.get(0)?
+        } else {
+            0
+        };
+
         Ok(count > 0)
     }
 
     /// Delete embeddings for a document hash
-    pub fn delete_embeddings(&self, hash: &str) -> Result<()> {
+    pub async fn delete_embeddings(&self, hash: &str) -> Result<()> {
         self.conn
-            .execute("DELETE FROM embeddings WHERE hash = ?1", [hash])?;
+            .execute("DELETE FROM embeddings WHERE hash = ?1", params![hash])
+            .await?;
         Ok(())
     }
 
     /// Count documents with embeddings
-    pub fn count_embeddings(&self, collection: Option<&str>) -> Result<i64> {
+    pub async fn count_embeddings(&self, collection: Option<&str>) -> Result<i64> {
         let count: i64 = if let Some(coll) = collection {
-            self.conn.query_row(
-                "SELECT COUNT(DISTINCT e.hash)
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT COUNT(DISTINCT e.hash)
                  FROM embeddings e
                  JOIN documents d ON d.hash = e.hash
                  WHERE d.collection = ?1 AND d.active = 1",
-                [coll],
-                |row| row.get(0),
-            )?
+                    params![coll],
+                )
+                .await?;
+
+            if let Some(row) = rows.next().await? {
+                row.get(0)?
+            } else {
+                0
+            }
         } else {
-            self.conn
-                .query_row("SELECT COUNT(DISTINCT hash) FROM embeddings", [], |row| {
-                    row.get(0)
-                })?
+            let mut rows = self
+                .conn
+                .query("SELECT COUNT(DISTINCT hash) FROM embeddings", ())
+                .await?;
+
+            if let Some(row) = rows.next().await? {
+                row.get(0)?
+            } else {
+                0
+            }
         };
         Ok(count)
     }
 
-    /// Get all embeddings for vector search
+    /// Get all embeddings for vector search (legacy - loads all into memory)
     /// Returns embeddings joined with document info
-    pub fn get_all_embeddings_for_search(
+    /// DEPRECATED: Use search_vector_native() for efficient native vector search
+    pub async fn get_all_embeddings_for_search(
         &self,
         collection: Option<&str>,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
     ) -> Result<Vec<EmbeddingSearchRow>> {
-        let sql = if collection.is_some() {
-            r#"
-            SELECT
-                e.hash,
-                e.chunk_index,
-                e.char_offset,
-                e.embedding,
-                d.id,
-                d.collection,
-                d.path,
-                d.title,
-                d.file_type
-            FROM embeddings e
-            JOIN documents d ON d.hash = e.hash
-            WHERE d.collection = ?1 AND d.active = 1
-            ORDER BY d.id, e.chunk_index
-            "#
-        } else {
-            r#"
-            SELECT
-                e.hash,
-                e.chunk_index,
-                e.char_offset,
-                e.embedding,
-                d.id,
-                d.collection,
-                d.path,
-                d.title,
-                d.file_type
-            FROM embeddings e
-            JOIN documents d ON d.hash = e.hash
-            WHERE d.active = 1
-            ORDER BY d.id, e.chunk_index
-            "#
-        };
-
-        let mut stmt = self.conn.prepare(sql)?;
         let mut results = Vec::new();
 
-        let mut rows = if let Some(coll) = collection {
-            stmt.query([coll])?
-        } else {
-            stmt.query([])?
-        };
+        // Build query dynamically based on filters
+        let mut where_clauses: Vec<String> = vec!["d.active = 1".to_string()];
+        let mut param_idx = 1;
 
-        while let Some(row) = rows.next()? {
+        if collection.is_some() {
+            where_clauses.push(format!("d.collection = ?{}", param_idx));
+            param_idx += 1;
+        }
+        if from_date.is_some() {
+            where_clauses.push(format!("d.modified_at >= ?{}", param_idx));
+            param_idx += 1;
+        }
+        if to_date.is_some() {
+            where_clauses.push(format!("d.modified_at <= ?{}", param_idx));
+        }
+
+        let query = format!(
+            r#"
+            SELECT
+                e.hash,
+                e.chunk_index,
+                e.char_offset,
+                e.embedding,
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.file_type
+            FROM embeddings e
+            JOIN documents d ON d.hash = e.hash
+            WHERE {}
+            ORDER BY d.id, e.chunk_index
+            "#,
+            where_clauses.join(" AND ")
+        );
+
+        // Build params dynamically
+        let mut params: Vec<libsql::Value> = vec![];
+        if let Some(coll) = collection {
+            params.push(coll.into());
+        }
+        if let Some(from) = from_date {
+            params.push(from.into());
+        }
+        if let Some(to) = to_date {
+            params.push(to.into());
+        }
+
+        let mut rows = self.conn.query(&query, params).await?;
+
+        while let Some(row) = rows.next().await? {
             results.push(EmbeddingSearchRow {
                 hash: row.get(0)?,
                 chunk_index: row.get(1)?,
@@ -1056,27 +1251,196 @@ impl Store {
         Ok(results)
     }
 
+    /// Ensure the vector index exists for native vector search.
+    /// Returns true if the index was created, false if it already existed or couldn't be created.
+    pub async fn ensure_vector_index(&self) -> Result<bool> {
+        schema::ensure_vector_index(&self.conn).await
+    }
+
+    /// Check if native vector search is available
+    pub async fn has_vector_index(&self) -> bool {
+        schema::has_vector_index(&self.conn).await
+    }
+
+    /// Native vector search using libsql's vector_top_k()
+    /// Uses the idx_embeddings_vector index for efficient KNN search.
+    /// Supports optional filtering by collection and date range (modified_at).
+    /// Returns None if native search is not available (falls back to legacy).
+    pub async fn search_vector_native(
+        &self,
+        query_embedding: &[f32],
+        collection: Option<&str>,
+        limit: usize,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
+    ) -> Result<Option<Vec<VectorSearchResult>>> {
+        // Try to ensure vector index exists
+        self.ensure_vector_index().await?;
+
+        // Check if index is actually available
+        if !self.has_vector_index().await {
+            return Ok(None); // Fall back to legacy search
+        }
+
+        // Convert f32 embedding to bytes (little-endian)
+        let embedding_bytes: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        // Build WHERE clause dynamically
+        // Note: ?1 = embedding bytes, ?2 = limit
+        let mut where_clauses: Vec<String> = vec!["d.active = 1".to_string()];
+        let mut param_idx = 3;
+
+        if collection.is_some() {
+            where_clauses.push(format!("d.collection = ?{}", param_idx));
+            param_idx += 1;
+        }
+        if from_date.is_some() {
+            where_clauses.push(format!("d.modified_at >= ?{}", param_idx));
+            param_idx += 1;
+        }
+        if to_date.is_some() {
+            where_clauses.push(format!("d.modified_at <= ?{}", param_idx));
+        }
+
+        let query = format!(
+            r#"
+            SELECT
+                e.hash,
+                e.chunk_index,
+                e.char_offset,
+                d.id,
+                d.collection,
+                d.path,
+                d.title,
+                d.file_type,
+                vector_distance_cos(e.embedding, ?1) as distance
+            FROM vector_top_k('idx_embeddings_vector', ?1, ?2) AS top_k
+            JOIN embeddings e ON e.rowid = top_k.id
+            JOIN documents d ON d.hash = e.hash
+            WHERE {}
+            ORDER BY distance ASC
+            "#,
+            where_clauses.join(" AND ")
+        );
+
+        // Build params dynamically
+        let mut params: Vec<libsql::Value> = vec![
+            embedding_bytes.into(),
+            (limit as i64).into(),
+        ];
+        if let Some(coll) = collection {
+            params.push(coll.into());
+        }
+        if let Some(from) = from_date {
+            params.push(from.into());
+        }
+        if let Some(to) = to_date {
+            params.push(to.into());
+        }
+
+        let query_result = self.conn.query(&query, params).await;
+
+        // If the query fails (e.g., index not working), return None to trigger fallback
+        let mut rows = match query_result {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!("Native vector search failed, using legacy: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let mut results = Vec::new();
+
+        while let Some(row) = rows.next().await? {
+            let distance: f64 = row.get(8)?;
+            // Convert cosine distance to similarity (1 - distance for cosine)
+            let similarity = 1.0 - distance;
+
+            results.push(VectorSearchResult {
+                hash: row.get(0)?,
+                chunk_index: row.get(1)?,
+                char_offset: row.get(2)?,
+                doc_id: row.get(3)?,
+                collection: row.get(4)?,
+                path: row.get(5)?,
+                title: row.get(6)?,
+                file_type: row.get(7)?,
+                similarity,
+            });
+        }
+
+        Ok(Some(results))
+    }
+
+    /// Legacy vector search - loads all embeddings and calculates similarity in Rust
+    /// Used as fallback when native vector search is not available
+    /// Supports optional date filtering (modified_at)
+    pub async fn search_vector_legacy(
+        &self,
+        query_embedding: &[f32],
+        collection: Option<&str>,
+        limit: usize,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let embeddings = self
+            .get_all_embeddings_for_search(collection, from_date, to_date)
+            .await?;
+
+        let mut scored: Vec<(f64, EmbeddingSearchRow)> = embeddings
+            .into_iter()
+            .map(|row| {
+                let embedding = bytes_to_embedding(&row.embedding);
+                let similarity = cosine_similarity(query_embedding, &embedding);
+                (similarity as f64, row)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(similarity, row)| VectorSearchResult {
+                hash: row.hash,
+                chunk_index: row.chunk_index,
+                char_offset: row.char_offset,
+                doc_id: row.doc_id,
+                collection: row.collection,
+                path: row.path,
+                title: row.title,
+                file_type: row.file_type,
+                similarity,
+            })
+            .collect())
+    }
+
     // -------------------------------------------------------------------------
     // Multi-get operations
     // -------------------------------------------------------------------------
 
     /// Match files by glob pattern.
     /// Returns files matching the pattern with their sizes (before loading content).
-    pub fn match_files_by_glob(&self, pattern: &str) -> Result<Vec<(String, String, i64)>> {
+    pub async fn match_files_by_glob(&self, pattern: &str) -> Result<Vec<(String, String, i64)>> {
         let glob = Pattern::new(pattern)
             .map_err(|e| Error::InvalidQuery(format!("Invalid glob pattern: {}", e)))?;
 
-        let mut stmt = self.conn.prepare(
-            "SELECT d.collection, d.path, LENGTH(c.content) as size
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT d.collection, d.path, LENGTH(c.content) as size
              FROM documents d
              JOIN content c ON c.hash = d.hash
              WHERE d.active = 1",
-        )?;
+                (),
+            )
+            .await?;
 
         let mut matches = Vec::new();
-        let mut rows = stmt.query([])?;
-
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().await? {
             let collection: String = row.get(0)?;
             let path: String = row.get(1)?;
             let size: i64 = row.get(2)?;
@@ -1095,7 +1459,7 @@ impl Store {
 
     /// Parse comma-separated list of paths.
     /// Returns list of (collection, path, size) tuples found.
-    pub fn parse_comma_list(&self, input: &str) -> Result<Vec<(String, String, i64)>> {
+    pub async fn parse_comma_list(&self, input: &str) -> Result<Vec<(String, String, i64)>> {
         let names: Vec<&str> = input
             .split(',')
             .map(|s| s.trim())
@@ -1107,31 +1471,29 @@ impl Store {
         for name in names {
             // Try exact match first (collection/path format)
             if let Some((coll, path)) = name.split_once('/') {
-                if let Ok(doc) = self.get_document(coll, path) {
-                    let content = self.get_content(&doc.hash)?;
+                if let Ok(doc) = self.get_document(coll, path).await {
+                    let content = self.get_content(&doc.hash).await?;
                     results.push((doc.collection, doc.path, content.size));
                     continue;
                 }
             }
 
             // Try suffix match
-            let mut stmt = self.conn.prepare(
-                "SELECT d.collection, d.path, LENGTH(c.content) as size
+            let pattern = format!("%{}", name);
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT d.collection, d.path, LENGTH(c.content) as size
                  FROM documents d
                  JOIN content c ON c.hash = d.hash
                  WHERE d.path LIKE ?1 AND d.active = 1
                  LIMIT 1",
-            )?;
+                    params![pattern],
+                )
+                .await?;
 
-            let pattern = format!("%{}", name);
-            if let Ok(row) = stmt.query_row([&pattern], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            }) {
-                results.push(row);
+            if let Some(row) = rows.next().await? {
+                results.push((row.get(0)?, row.get(1)?, row.get(2)?));
             }
             // Note: silently skip if not found (could add error collection)
         }
@@ -1140,7 +1502,7 @@ impl Store {
     }
 
     /// Get multiple documents with size filtering.
-    pub fn multi_get(
+    pub async fn multi_get(
         &self,
         pattern: &str,
         max_bytes: usize,
@@ -1151,15 +1513,15 @@ impl Store {
         let is_comma_list = pattern.contains(',') && !is_glob;
 
         let files = if is_glob {
-            self.match_files_by_glob(pattern)?
+            self.match_files_by_glob(pattern).await?
         } else if is_comma_list {
-            self.parse_comma_list(pattern)?
+            self.parse_comma_list(pattern).await?
         } else {
             // Single file
             let parts: Vec<&str> = pattern.splitn(2, '/').collect();
             if parts.len() == 2 {
-                if let Ok(doc) = self.get_document(parts[0], parts[1]) {
-                    let content = self.get_content(&doc.hash)?;
+                if let Ok(doc) = self.get_document(parts[0], parts[1]).await {
+                    let content = self.get_content(&doc.hash).await?;
                     vec![(doc.collection, doc.path, content.size)]
                 } else {
                     vec![]
@@ -1193,8 +1555,8 @@ impl Store {
             }
 
             // Get document and content
-            if let Ok(doc) = self.get_document(&collection, &path) {
-                if let Ok(content) = self.get_content(&doc.hash) {
+            if let Ok(doc) = self.get_document(&collection, &path).await {
+                if let Ok(content) = self.get_content(&doc.hash).await {
                     let mut text = String::from_utf8(content.data.clone())
                         .unwrap_or_else(|_| "[Binary content]".to_string());
 
@@ -1239,6 +1601,49 @@ pub struct EmbeddingRow {
     pub created_at: String,
 }
 
+/// Result from native vector search
+#[derive(Debug, Clone)]
+pub struct VectorSearchResult {
+    pub hash: String,
+    pub chunk_index: i32,
+    pub char_offset: i32,
+    pub doc_id: i64,
+    pub collection: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub file_type: String,
+    /// Cosine similarity score (0.0 - 1.0)
+    pub similarity: f64,
+}
+
+/// Convert bytes to f32 embedding (for legacy vector search)
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let arr: [u8; 4] = chunk.try_into().unwrap();
+            f32::from_le_bytes(arr)
+        })
+        .collect()
+}
+
+/// Calculate cosine similarity between two embeddings (for legacy vector search)
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot / (norm_a * norm_b)
+}
+
 /// Row for embedding search (joined with document info)
 #[derive(Debug, Clone)]
 pub struct EmbeddingSearchRow {
@@ -1257,69 +1662,72 @@ pub struct EmbeddingSearchRow {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_open_memory() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_open_memory() {
+        let store = Store::open_memory().await.unwrap();
         assert_eq!(store.path().to_str(), Some(":memory:"));
     }
 
-    #[test]
-    fn test_collection_operations() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_collection_operations() {
+        let store = Store::open_memory().await.unwrap();
 
         // Add collection
         store
             .add_collection("test", "/tmp/test", &["**/*.md"])
+            .await
             .unwrap();
 
         // Get collection
-        let coll = store.get_collection("test").unwrap();
+        let coll = store.get_collection("test").await.unwrap();
         assert_eq!(coll.name, "test");
         assert_eq!(coll.path, "/tmp/test");
         assert_eq!(coll.patterns, vec!["**/*.md"]);
 
         // List collections
-        let collections = store.list_collections().unwrap();
+        let collections = store.list_collections().await.unwrap();
         assert_eq!(collections.len(), 1);
 
         // Remove collection
-        store.remove_collection("test").unwrap();
-        let collections = store.list_collections().unwrap();
+        store.remove_collection("test").await.unwrap();
+        let collections = store.list_collections().await.unwrap();
         assert_eq!(collections.len(), 0);
     }
 
-    #[test]
-    fn test_content_operations() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_content_operations() {
+        let store = Store::open_memory().await.unwrap();
 
         let hash = "abc123";
         let data = b"Hello, world!";
 
         // Insert content
-        store.insert_content(hash, data, "text/plain").unwrap();
+        store.insert_content(hash, data, "text/plain").await.unwrap();
 
         // Check exists
-        assert!(store.content_exists(hash).unwrap());
-        assert!(!store.content_exists("nonexistent").unwrap());
+        assert!(store.content_exists(hash).await.unwrap());
+        assert!(!store.content_exists("nonexistent").await.unwrap());
 
         // Get content
-        let content = store.get_content(hash).unwrap();
+        let content = store.get_content(hash).await.unwrap();
         assert_eq!(content.data, data);
         assert_eq!(content.content_type, "text/plain");
     }
 
-    #[test]
-    fn test_document_operations() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_document_operations() {
+        let store = Store::open_memory().await.unwrap();
 
         // Add collection first
         store
             .add_collection("test", "/tmp/test", &["**/*.md"])
+            .await
             .unwrap();
 
         // Insert content
         store
             .insert_content("hash123", b"# Hello\n\nWorld", "text/markdown")
+            .await
             .unwrap();
 
         // Upsert document
@@ -1332,31 +1740,33 @@ mod tests {
                 ".md",
                 "Hello World",
             )
+            .await
             .unwrap();
 
         assert!(id > 0);
 
         // Get document
-        let doc = store.get_document("test", "hello.md").unwrap();
+        let doc = store.get_document("test", "hello.md").await.unwrap();
         assert_eq!(doc.title, Some("Hello".to_string()));
         assert_eq!(doc.hash, "hash123");
 
         // Count documents
-        assert_eq!(store.count_documents(Some("test")).unwrap(), 1);
-        assert_eq!(store.count_documents(None).unwrap(), 1);
+        assert_eq!(store.count_documents(Some("test")).await.unwrap(), 1);
+        assert_eq!(store.count_documents(None).await.unwrap(), 1);
 
         // Deactivate
-        store.deactivate_document("test", "hello.md").unwrap();
-        assert_eq!(store.count_documents(Some("test")).unwrap(), 0);
+        store.deactivate_document("test", "hello.md").await.unwrap();
+        assert_eq!(store.count_documents(Some("test")).await.unwrap(), 0);
     }
 
-    #[test]
-    fn test_search_bm25() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_search_bm25() {
+        let store = Store::open_memory().await.unwrap();
 
         // Add collection
         store
             .add_collection("test", "/tmp/test", &["**/*.md"])
+            .await
             .unwrap();
 
         // Insert content and documents
@@ -1366,6 +1776,7 @@ mod tests {
                 b"# Rust Programming\n\nRust is a systems programming language.",
                 "text/markdown",
             )
+            .await
             .unwrap();
         store
             .insert_content(
@@ -1373,6 +1784,7 @@ mod tests {
                 b"# Python Tutorial\n\nPython is a dynamic language.",
                 "text/markdown",
             )
+            .await
             .unwrap();
         store
             .insert_content(
@@ -1380,6 +1792,7 @@ mod tests {
                 b"# JavaScript Guide\n\nJavaScript runs in browsers.",
                 "text/markdown",
             )
+            .await
             .unwrap();
 
         store
@@ -1391,6 +1804,7 @@ mod tests {
                 ".md",
                 "Rust Programming Rust is a systems programming language",
             )
+            .await
             .unwrap();
         store
             .upsert_document(
@@ -1401,6 +1815,7 @@ mod tests {
                 ".md",
                 "Python Tutorial Python is a dynamic language",
             )
+            .await
             .unwrap();
         store
             .upsert_document(
@@ -1411,31 +1826,41 @@ mod tests {
                 ".md",
                 "JavaScript Guide JavaScript runs in browsers",
             )
+            .await
             .unwrap();
 
         // Search for "rust"
-        let results = store.search_bm25("\"rust\"*", None, 10, false).unwrap();
+        let results = store
+            .search_bm25("\"rust\"*", None, 10, false, None, None)
+            .await
+            .unwrap();
         assert!(!results.is_empty(), "Should find results for 'rust'");
         assert_eq!(results[0].path, "rust.md");
 
         // Search for "programming"
         let results = store
-            .search_bm25("\"programming\"*", None, 10, false)
+            .search_bm25("\"programming\"*", None, 10, false, None, None)
+            .await
             .unwrap();
         assert!(!results.is_empty(), "Should find results for 'programming'");
 
         // Search for "language"
-        let results = store.search_bm25("\"language\"*", None, 10, false).unwrap();
+        let results = store
+            .search_bm25("\"language\"*", None, 10, false, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2, "Should find 2 results for 'language'");
 
         // Search with collection filter
         let results = store
-            .search_bm25("\"rust\"*", Some("test"), 10, false)
+            .search_bm25("\"rust\"*", Some("test"), 10, false, None, None)
+            .await
             .unwrap();
         assert!(!results.is_empty());
 
         let results = store
-            .search_bm25("\"rust\"*", Some("nonexistent"), 10, false)
+            .search_bm25("\"rust\"*", Some("nonexistent"), 10, false, None, None)
+            .await
             .unwrap();
         assert!(results.is_empty());
     }
@@ -1483,14 +1908,16 @@ mod tests {
         assert!(!is_docid("qfs://collection/path")); // Virtual path
     }
 
-    #[test]
-    fn test_get_document_by_docid() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_get_document_by_docid() {
+        let store = Store::open_memory().await.unwrap();
         store
             .add_collection("test", "/tmp/test", &["**/*.md"])
+            .await
             .unwrap();
         store
             .insert_content("abc123def456", b"Test content", "text/plain")
+            .await
             .unwrap();
         store
             .upsert_document(
@@ -1501,90 +1928,104 @@ mod tests {
                 ".md",
                 "Test",
             )
+            .await
             .unwrap();
 
-        let doc = store.get_document_by_docid("#abc123").unwrap();
+        let doc = store.get_document_by_docid("#abc123").await.unwrap();
         assert_eq!(doc.path, "file.md");
 
-        let doc = store.get_document_by_docid("abc123").unwrap();
+        let doc = store.get_document_by_docid("abc123").await.unwrap();
         assert_eq!(doc.path, "file.md");
     }
 
-    #[test]
-    fn test_list_files() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_list_files() {
+        let store = Store::open_memory().await.unwrap();
         store
             .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .await
             .unwrap();
         store
             .insert_content("hash1", b"content1", "text/plain")
+            .await
             .unwrap();
         store
             .insert_content("hash2", b"content2", "text/plain")
+            .await
             .unwrap();
 
         store
             .upsert_document("docs", "readme.md", None, "hash1", ".md", "content")
+            .await
             .unwrap();
         store
             .upsert_document("docs", "guide/intro.md", None, "hash2", ".md", "content")
+            .await
             .unwrap();
 
         // List all
-        let files = store.list_files("docs", None).unwrap();
+        let files = store.list_files("docs", None).await.unwrap();
         assert_eq!(files.len(), 2);
 
         // List with prefix
-        let files = store.list_files("docs", Some("guide")).unwrap();
+        let files = store.list_files("docs", Some("guide")).await.unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].path.starts_with("guide"));
     }
 
-    fn setup_multi_get_test_store() -> Store {
-        let store = Store::open_memory().unwrap();
+    async fn setup_multi_get_test_store() -> Store {
+        let store = Store::open_memory().await.unwrap();
         store
             .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .await
             .unwrap();
 
         // Add test documents
         store
             .insert_content("hash1", b"# Doc 1\nSmall file", "text/markdown")
+            .await
             .unwrap();
         store
             .insert_content("hash2", b"# Doc 2\nAnother small file", "text/markdown")
+            .await
             .unwrap();
         store
             .insert_content("hash3", &vec![b'x'; 20000], "text/plain")
+            .await
             .unwrap(); // Large file
 
         store
             .upsert_document("docs", "readme.md", Some("Readme"), "hash1", ".md", "Doc 1")
+            .await
             .unwrap();
         store
             .upsert_document("docs", "guide.md", Some("Guide"), "hash2", ".md", "Doc 2")
+            .await
             .unwrap();
         store
             .upsert_document("docs", "large.txt", Some("Large"), "hash3", ".txt", "Large")
+            .await
             .unwrap();
 
         store
     }
 
-    #[test]
-    fn test_multi_get_glob_pattern() {
-        let store = setup_multi_get_test_store();
-        let results = store.multi_get("docs/**/*.md", 10240, None).unwrap();
+    #[tokio::test]
+    async fn test_multi_get_glob_pattern() {
+        let store = setup_multi_get_test_store().await;
+        let results = store.multi_get("docs/**/*.md", 10240, None).await.unwrap();
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.path.ends_with(".md")));
         assert!(results.iter().all(|r| !r.skipped));
     }
 
-    #[test]
-    fn test_multi_get_comma_list() {
-        let store = setup_multi_get_test_store();
+    #[tokio::test]
+    async fn test_multi_get_comma_list() {
+        let store = setup_multi_get_test_store().await;
         let results = store
             .multi_get("docs/readme.md, docs/guide.md", 10240, None)
+            .await
             .unwrap();
 
         assert_eq!(results.len(), 2);
@@ -1592,10 +2033,10 @@ mod tests {
         assert!(results.iter().any(|r| r.path == "docs/guide.md"));
     }
 
-    #[test]
-    fn test_multi_get_max_bytes_skip() {
-        let store = setup_multi_get_test_store();
-        let results = store.multi_get("docs/**/*", 10240, None).unwrap();
+    #[tokio::test]
+    async fn test_multi_get_max_bytes_skip() {
+        let store = setup_multi_get_test_store().await;
+        let results = store.multi_get("docs/**/*", 10240, None).await.unwrap();
 
         let large = results.iter().find(|r| r.path.contains("large")).unwrap();
         assert!(large.skipped);
@@ -1603,116 +2044,154 @@ mod tests {
         assert!(large.content.is_none());
     }
 
-    #[test]
-    fn test_multi_get_max_lines_truncation() {
-        let store = setup_multi_get_test_store();
-        let results = store.multi_get("docs/readme.md", 10240, Some(1)).unwrap();
+    #[tokio::test]
+    async fn test_multi_get_max_lines_truncation() {
+        let store = setup_multi_get_test_store().await;
+        let results = store
+            .multi_get("docs/readme.md", 10240, Some(1))
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         let content = results[0].content.as_ref().unwrap();
         assert!(content.contains("[... truncated"));
     }
 
-    #[test]
-    fn test_multi_get_no_matches() {
-        let store = setup_multi_get_test_store();
+    #[tokio::test]
+    async fn test_multi_get_no_matches() {
+        let store = setup_multi_get_test_store().await;
         let results = store
             .multi_get("nonexistent/**/*.xyz", 10240, None)
+            .await
             .unwrap();
 
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn test_set_and_get_global_context() {
-        let store = Store::open_memory().unwrap();
-        store.set_context(None, "/", "Global context").unwrap();
+    #[tokio::test]
+    async fn test_set_and_get_global_context() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .set_context(None, "/", "Global context")
+            .await
+            .unwrap();
 
-        let ctx = store.get_global_context().unwrap();
+        let ctx = store.get_global_context().await.unwrap();
         assert_eq!(ctx, Some("Global context".to_string()));
     }
 
-    #[test]
-    fn test_set_and_find_collection_context() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_set_and_find_collection_context() {
+        let store = Store::open_memory().await.unwrap();
         store
             .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .await
             .unwrap();
 
         store
             .set_context(Some("docs"), "/", "Documentation")
+            .await
             .unwrap();
         store
             .set_context(Some("docs"), "/api", "API reference")
+            .await
             .unwrap();
         store
             .set_context(Some("docs"), "/api/v2", "API v2 docs")
+            .await
             .unwrap();
 
         // Most specific match wins
         let ctx = store
             .find_context_for_path("docs", "/api/v2/endpoints.md")
+            .await
             .unwrap();
         assert_eq!(ctx, Some("API v2 docs".to_string()));
 
         let ctx = store
             .find_context_for_path("docs", "/api/v1/old.md")
+            .await
             .unwrap();
         assert_eq!(ctx, Some("API reference".to_string()));
 
-        let ctx = store.find_context_for_path("docs", "/readme.md").unwrap();
+        let ctx = store
+            .find_context_for_path("docs", "/readme.md")
+            .await
+            .unwrap();
         assert_eq!(ctx, Some("Documentation".to_string()));
     }
 
-    #[test]
-    fn test_fallback_to_global() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_fallback_to_global() {
+        let store = Store::open_memory().await.unwrap();
         store
             .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .await
             .unwrap();
 
-        store.set_context(None, "/", "Global fallback").unwrap();
+        store
+            .set_context(None, "/", "Global fallback")
+            .await
+            .unwrap();
 
-        let ctx = store.find_context_for_path("docs", "/any/path.md").unwrap();
+        let ctx = store
+            .find_context_for_path("docs", "/any/path.md")
+            .await
+            .unwrap();
         assert_eq!(ctx, Some("Global fallback".to_string()));
     }
 
-    #[test]
-    fn test_get_all_contexts() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_get_all_contexts() {
+        let store = Store::open_memory().await.unwrap();
         store
             .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .await
             .unwrap();
 
-        store.set_context(None, "/", "Global").unwrap();
-        store.set_context(Some("docs"), "/", "Docs").unwrap();
-        store.set_context(Some("docs"), "/api", "API").unwrap();
+        store.set_context(None, "/", "Global").await.unwrap();
+        store.set_context(Some("docs"), "/", "Docs").await.unwrap();
+        store
+            .set_context(Some("docs"), "/api", "API")
+            .await
+            .unwrap();
 
         let contexts = store
             .get_all_contexts_for_path("docs", "/api/file.md")
+            .await
             .unwrap();
         assert_eq!(contexts, vec!["Global", "Docs", "API"]);
     }
 
-    #[test]
-    fn test_remove_context() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_remove_context() {
+        let store = Store::open_memory().await.unwrap();
         store
             .set_context(Some("docs"), "/api", "API context")
+            .await
             .unwrap();
 
-        assert!(store.remove_context(Some("docs"), "/api").unwrap());
-        assert!(!store.remove_context(Some("docs"), "/api").unwrap()); // Already removed
+        assert!(store
+            .remove_context(Some("docs"), "/api")
+            .await
+            .unwrap());
+        assert!(!store
+            .remove_context(Some("docs"), "/api")
+            .await
+            .unwrap()); // Already removed
     }
 
-    #[test]
-    fn test_list_contexts() {
-        let store = Store::open_memory().unwrap();
-        store.set_context(None, "/", "Global").unwrap();
-        store.set_context(Some("docs"), "/", "Docs").unwrap();
-        store.set_context(Some("docs"), "/api", "API").unwrap();
+    #[tokio::test]
+    async fn test_list_contexts() {
+        let store = Store::open_memory().await.unwrap();
+        store.set_context(None, "/", "Global").await.unwrap();
+        store.set_context(Some("docs"), "/", "Docs").await.unwrap();
+        store
+            .set_context(Some("docs"), "/api", "API")
+            .await
+            .unwrap();
 
-        let contexts = store.list_contexts().unwrap();
+        let contexts = store.list_contexts().await.unwrap();
         assert_eq!(contexts.len(), 3);
 
         // First should be global
@@ -1721,20 +2200,22 @@ mod tests {
         assert_eq!(contexts[0].context, "Global");
     }
 
-    #[test]
-    fn test_get_collections_without_context() {
-        let store = Store::open_memory().unwrap();
+    #[tokio::test]
+    async fn test_get_collections_without_context() {
+        let store = Store::open_memory().await.unwrap();
         store
             .add_collection("docs", "/tmp/docs", &["**/*.md"])
+            .await
             .unwrap();
         store
             .add_collection("code", "/tmp/code", &["**/*.rs"])
+            .await
             .unwrap();
 
         // Add context only to docs
-        store.set_context(Some("docs"), "/", "Docs").unwrap();
+        store.set_context(Some("docs"), "/", "Docs").await.unwrap();
 
-        let without = store.get_collections_without_context().unwrap();
+        let without = store.get_collections_without_context().await.unwrap();
         assert_eq!(without.len(), 1);
         assert_eq!(without[0].name, "code");
     }

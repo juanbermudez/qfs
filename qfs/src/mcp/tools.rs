@@ -12,7 +12,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "qfs_search".to_string(),
-            description: "Full-text search across indexed documents using BM25 ranking. Returns relevant documents with snippets.".to_string(),
+            description: "Full-text search across indexed documents using BM25 ranking. Returns relevant documents with snippets. Supports date filtering.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -28,6 +28,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum number of results (default: 20)",
                         "default": 20
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or after this date (ISO 8601, e.g., '2025-01-01')"
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or before this date (ISO 8601, e.g., '2025-12-31')"
                     }
                 },
                 "required": ["query"]
@@ -35,7 +43,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "qfs_vsearch".to_string(),
-            description: "Semantic vector search using embeddings. Requires embeddings to be generated first.".to_string(),
+            description: "Semantic vector search using embeddings. Requires embeddings to be generated first. Supports date filtering.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -51,6 +59,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum number of results (default: 20)",
                         "default": 20
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or after this date (ISO 8601, e.g., '2025-01-01')"
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or before this date (ISO 8601, e.g., '2025-12-31')"
                     }
                 },
                 "required": ["query"]
@@ -58,7 +74,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "qfs_query".to_string(),
-            description: "Hybrid search combining BM25 and vector search with Reciprocal Rank Fusion. Requires mode parameter to select search type.".to_string(),
+            description: "Hybrid search combining BM25 and vector search with Reciprocal Rank Fusion. Supports date filtering.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -80,6 +96,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum number of results (default: 20)",
                         "default": 20
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or after this date (ISO 8601, e.g., '2025-01-01')"
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "Filter documents modified on or before this date (ISO 8601, e.g., '2025-12-31')"
                     }
                 },
                 "required": ["query"]
@@ -153,18 +177,18 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
 }
 
 /// Handle tool call dispatch
-pub fn handle_tool_call(
+pub async fn handle_tool_call(
     store: &Store,
     tool_name: &str,
     arguments: &Value,
 ) -> Result<ToolResult, JsonRpcError> {
     match tool_name {
-        "qfs_search" => tool_search(store, arguments, SearchMode::Bm25),
-        "qfs_vsearch" => tool_search(store, arguments, SearchMode::Vector),
-        "qfs_query" => tool_query(store, arguments),
-        "qfs_get" => tool_get(store, arguments),
-        "qfs_multi_get" => tool_multi_get(store, arguments),
-        "qfs_status" => tool_status(store),
+        "qfs_search" => tool_search(store, arguments, SearchMode::Bm25).await,
+        "qfs_vsearch" => tool_search(store, arguments, SearchMode::Vector).await,
+        "qfs_query" => tool_query(store, arguments).await,
+        "qfs_get" => tool_get(store, arguments).await,
+        "qfs_multi_get" => tool_multi_get(store, arguments).await,
+        "qfs_status" => tool_status(store).await,
         _ => Err(JsonRpcError::invalid_params(format!(
             "Unknown tool: {}",
             tool_name
@@ -173,7 +197,11 @@ pub fn handle_tool_call(
 }
 
 /// Execute search tool (qfs_search or qfs_vsearch)
-fn tool_search(store: &Store, args: &Value, mode: SearchMode) -> Result<ToolResult, JsonRpcError> {
+async fn tool_search(
+    store: &Store,
+    args: &Value,
+    mode: SearchMode,
+) -> Result<ToolResult, JsonRpcError> {
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -181,6 +209,8 @@ fn tool_search(store: &Store, args: &Value, mode: SearchMode) -> Result<ToolResu
 
     let collection = args.get("collection").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let from_date = args.get("from_date").and_then(|v| v.as_str());
+    let to_date = args.get("to_date").and_then(|v| v.as_str());
 
     let options = SearchOptions {
         mode,
@@ -188,11 +218,14 @@ fn tool_search(store: &Store, args: &Value, mode: SearchMode) -> Result<ToolResu
         min_score: 0.0,
         collection: collection.map(String::from),
         include_binary: false,
+        from_date: from_date.map(String::from),
+        to_date: to_date.map(String::from),
     };
 
     let searcher = Searcher::new(store);
     let results = searcher
         .search(query, options)
+        .await
         .map_err(|e| JsonRpcError::server_error(e.to_string()))?;
 
     let text = serde_json::to_string_pretty(&results)
@@ -202,7 +235,7 @@ fn tool_search(store: &Store, args: &Value, mode: SearchMode) -> Result<ToolResu
 }
 
 /// Execute query tool with mode selection (qfs_query)
-fn tool_query(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
+async fn tool_query(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -216,6 +249,8 @@ fn tool_query(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
 
     let collection = args.get("collection").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let from_date = args.get("from_date").and_then(|v| v.as_str());
+    let to_date = args.get("to_date").and_then(|v| v.as_str());
 
     let options = SearchOptions {
         mode,
@@ -223,11 +258,14 @@ fn tool_query(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
         min_score: 0.0,
         collection: collection.map(String::from),
         include_binary: false,
+        from_date: from_date.map(String::from),
+        to_date: to_date.map(String::from),
     };
 
     let searcher = Searcher::new(store);
     let results = searcher
         .search(query, options)
+        .await
         .map_err(|e| JsonRpcError::server_error(e.to_string()))?;
 
     let text = serde_json::to_string_pretty(&results)
@@ -237,7 +275,7 @@ fn tool_query(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
 }
 
 /// Execute get tool (qfs_get)
-fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
+async fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -271,6 +309,7 @@ fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
     let doc = if crate::store::is_docid(clean_path) {
         store
             .get_document_by_docid(clean_path)
+            .await
             .map_err(|e| JsonRpcError::server_error(e.to_string()))?
     } else {
         // Parse path as collection/relative_path
@@ -282,6 +321,7 @@ fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
         }
         store
             .get_document(parts[0], parts[1])
+            .await
             .map_err(|e| JsonRpcError::server_error(e.to_string()))?
     };
 
@@ -297,7 +337,7 @@ fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
     });
 
     if include_content {
-        if let Ok(content) = store.get_content(&doc.hash) {
+        if let Ok(content) = store.get_content(&doc.hash).await {
             if let Ok(text) = String::from_utf8(content.data.clone()) {
                 // Apply line extraction
                 let mut output = crate::extract_lines(&text, effective_from, max_lines);
@@ -328,7 +368,7 @@ fn tool_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
 }
 
 /// Execute multi_get tool (qfs_multi_get)
-fn tool_multi_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
+async fn tool_multi_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcError> {
     let pattern = args
         .get("pattern")
         .and_then(|v| v.as_str())
@@ -346,6 +386,7 @@ fn tool_multi_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcErro
 
     let results = store
         .multi_get(pattern, max_bytes, max_lines)
+        .await
         .map_err(|e| JsonRpcError::server_error(e.to_string()))?;
 
     let text = serde_json::to_string_pretty(&results)
@@ -355,31 +396,30 @@ fn tool_multi_get(store: &Store, args: &Value) -> Result<ToolResult, JsonRpcErro
 }
 
 /// Execute status tool (qfs_status)
-fn tool_status(store: &Store) -> Result<ToolResult, JsonRpcError> {
+async fn tool_status(store: &Store) -> Result<ToolResult, JsonRpcError> {
     let collections = store
         .list_collections()
+        .await
         .map_err(|e| JsonRpcError::server_error(e.to_string()))?;
 
-    let total_docs = store.count_documents(None).unwrap_or(0);
-    let total_embeddings = store.count_embeddings(None).unwrap_or(0);
+    let total_docs = store.count_documents(None).await.unwrap_or(0);
+    let total_embeddings = store.count_embeddings(None).await.unwrap_or(0);
 
     let db_size = store.database_size().unwrap_or(0);
 
-    let collection_stats: Vec<Value> = collections
-        .iter()
-        .map(|col| {
-            let doc_count = store.count_documents(Some(&col.name)).unwrap_or(0);
-            let embed_count = store.count_embeddings(Some(&col.name)).unwrap_or(0);
-            json!({
-                "name": col.name,
-                "path": col.path,
-                "documents": doc_count,
-                "embeddings": embed_count,
-                "patterns": col.patterns,
-                "updatedAt": col.updated_at
-            })
-        })
-        .collect();
+    let mut collection_stats = Vec::new();
+    for col in &collections {
+        let doc_count = store.count_documents(Some(&col.name)).await.unwrap_or(0);
+        let embed_count = store.count_embeddings(Some(&col.name)).await.unwrap_or(0);
+        collection_stats.push(json!({
+            "name": col.name,
+            "path": col.path,
+            "documents": doc_count,
+            "embeddings": embed_count,
+            "patterns": col.patterns,
+            "updatedAt": col.updated_at
+        }));
+    }
 
     let status = json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -432,48 +472,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_unknown_tool_error() {
-        let store = Store::open_memory().unwrap();
-        let result = handle_tool_call(&store, "unknown_tool", &json!({}));
+    #[tokio::test]
+    async fn test_unknown_tool_error() {
+        let store = Store::open_memory().await.unwrap();
+        let result = handle_tool_call(&store, "unknown_tool", &json!({})).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, -32602);
     }
 
-    #[test]
-    fn test_missing_query_error() {
-        let store = Store::open_memory().unwrap();
-        let result = handle_tool_call(&store, "qfs_search", &json!({}));
+    #[tokio::test]
+    async fn test_missing_query_error() {
+        let store = Store::open_memory().await.unwrap();
+        let result = handle_tool_call(&store, "qfs_search", &json!({})).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("Missing query"));
     }
 
-    #[test]
-    fn test_status_tool() {
-        let store = Store::open_memory().unwrap();
-        let result = handle_tool_call(&store, "qfs_status", &json!({}));
+    #[tokio::test]
+    async fn test_status_tool() {
+        let store = Store::open_memory().await.unwrap();
+        let result = handle_tool_call(&store, "qfs_status", &json!({})).await;
         assert!(result.is_ok());
         let tool_result = result.unwrap();
         assert!(!tool_result.content.is_empty());
         assert!(tool_result.content[0].text.contains("version"));
     }
 
-    #[test]
-    fn test_search_empty_results() {
-        let store = Store::open_memory().unwrap();
-        let result = handle_tool_call(&store, "qfs_search", &json!({"query": "nonexistent"}));
+    #[tokio::test]
+    async fn test_search_empty_results() {
+        let store = Store::open_memory().await.unwrap();
+        let result = handle_tool_call(&store, "qfs_search", &json!({"query": "nonexistent"})).await;
         assert!(result.is_ok());
         let tool_result = result.unwrap();
         // Should return empty array, not error
         assert!(tool_result.content[0].text.contains("[]"));
     }
 
-    #[test]
-    fn test_get_invalid_path() {
-        let store = Store::open_memory().unwrap();
-        let result = handle_tool_call(&store, "qfs_get", &json!({"path": "invalid"}));
+    #[tokio::test]
+    async fn test_get_invalid_path() {
+        let store = Store::open_memory().await.unwrap();
+        let result = handle_tool_call(&store, "qfs_get", &json!({"path": "invalid"})).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("format"));

@@ -30,3 +30,19 @@ lcov.info
 # Backup files
 *.bak
 *.orig
+libsql-test/target/
+
+# Claude Code / AI steering
+.task/
+CLAUDE.md
+IMPLEMENTATION_PLAN.md
+*.skill
+
+# Embedding cache and ML models
+.fastembed_cache/
+*.onnx
+*.safetensors
+*.gguf
+*.ggml
+*.pt
+*.pth

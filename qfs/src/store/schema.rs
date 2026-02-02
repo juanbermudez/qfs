@@ -1,10 +1,11 @@
 //! Database schema for QFS
 
 use crate::error::Result;
-use rusqlite::Connection;
+use libsql::Connection;
 
 /// Current schema version
-pub const SCHEMA_VERSION: i64 = 1;
+/// v4: Changed embeddings column from BLOB to F32_BLOB(384) for native vector indexing
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// SQL to create the database schema
 const SCHEMA_SQL: &str = r#"
@@ -46,12 +47,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 );
 
 -- Vector embeddings (for optional semantic search)
+-- Using libsql native F32_BLOB(384) for vector storage and indexing
+-- 384 dimensions matches all-MiniLM-L6-v2 (default model)
 CREATE TABLE IF NOT EXISTS embeddings (
     hash TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
     char_offset INTEGER NOT NULL,
     model TEXT NOT NULL,
-    embedding BLOB NOT NULL,
+    embedding F32_BLOB(384),
     created_at TEXT NOT NULL,
     PRIMARY KEY (hash, chunk_index)
 );
@@ -90,40 +93,57 @@ CREATE INDEX IF NOT EXISTS idx_path_contexts_collection ON path_contexts(collect
 -- Note: FTS5 doesn't support traditional triggers, so we sync manually
 -- in the application code using DELETE + INSERT pattern.
 -- This is the recommended approach for FTS5 external content.
+
+-- Note: Vector index for native semantic search (idx_embeddings_vector)
+-- is created lazily when first embedding is inserted to allow libsql
+-- to detect the vector dimensions. See ensure_vector_index().
 "#;
 
 /// Ensure the database schema is up to date
-pub fn ensure_schema(conn: &Connection) -> Result<()> {
+pub async fn ensure_schema(conn: &Connection) -> Result<()> {
     // Check if schema exists
-    let table_exists: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='index_state'",
-        [],
-        |row| row.get(0),
-    )?;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='index_state'",
+            (),
+        )
+        .await?;
+
+    let table_exists: bool = if let Some(row) = rows.next().await? {
+        row.get::<i64>(0)? > 0
+    } else {
+        false
+    };
 
     if !table_exists {
         // Create initial schema
-        conn.execute_batch(SCHEMA_SQL)?;
+        conn.execute_batch(SCHEMA_SQL).await?;
 
         // Set schema version
         conn.execute(
             "INSERT INTO index_state (key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
-        )?;
+        )
+        .await?;
 
         tracing::info!("Created database schema version {}", SCHEMA_VERSION);
     } else {
         // Check schema version
-        let version: i64 = conn
-            .query_row(
+        let mut rows = conn
+            .query(
                 "SELECT CAST(value AS INTEGER) FROM index_state WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
+                (),
             )
-            .unwrap_or(0);
+            .await?;
+
+        let version: i64 = if let Some(row) = rows.next().await? {
+            row.get(0)?
+        } else {
+            0
+        };
 
         if version < SCHEMA_VERSION {
-            migrate(conn, version)?;
+            migrate(conn, version).await?;
         }
     }
 
@@ -131,7 +151,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 }
 
 /// Migrate from an older schema version
-fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
+async fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
     tracing::info!(
         "Migrating database from version {} to {}",
         from_version,
@@ -139,34 +159,134 @@ fn migrate(conn: &Connection, from_version: i64) -> Result<()> {
     );
 
     // Add migration steps here as schema evolves
-    // For now, we only have version 1
+    // Version 2: libsql migration (schema compatible, just version bump)
+    // Version 3: Vector index support (created lazily, see ensure_vector_index)
 
     // Update schema version
     conn.execute(
         "UPDATE index_state SET value = ?1 WHERE key = 'schema_version'",
         [SCHEMA_VERSION.to_string()],
-    )?;
+    )
+    .await?;
 
     Ok(())
+}
+
+/// Ensure the vector index exists for native vector search.
+/// This is called lazily when embeddings are present, since libsql
+/// needs to detect vector dimensions from existing data.
+///
+/// Note: Vector index creation may fail if embeddings were stored as raw BLOB
+/// rather than using libsql's vector32() function. In that case, the legacy
+/// manual cosine similarity search will be used as fallback.
+pub async fn ensure_vector_index(conn: &Connection) -> Result<bool> {
+    // Check if index already exists
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_embeddings_vector'",
+            (),
+        )
+        .await?;
+
+    let exists: bool = if let Some(row) = rows.next().await? {
+        row.get::<i64>(0)? > 0
+    } else {
+        false
+    };
+
+    if exists {
+        return Ok(false); // Index already exists
+    }
+
+    // Check if there are any embeddings to index
+    let mut rows = conn.query("SELECT COUNT(*) FROM embeddings", ()).await?;
+
+    let count: i64 = if let Some(row) = rows.next().await? {
+        row.get(0)?
+    } else {
+        0
+    };
+
+    if count == 0 {
+        return Ok(false); // No embeddings to index
+    }
+
+    // Try to create the vector index
+    // Uses cosine similarity metric (recommended for text embeddings)
+    // This may fail if embeddings were stored as raw BLOB (legacy format)
+    let result = conn
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_embeddings_vector
+                ON embeddings(libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))",
+            (),
+        )
+        .await;
+
+    match result {
+        Ok(_) => {
+            tracing::info!(
+                "Created vector index for native semantic search ({} embeddings)",
+                count
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            // Index creation failed - likely due to legacy BLOB format
+            // This is expected for databases with pre-existing embeddings
+            tracing::debug!(
+                "Vector index creation skipped (embeddings may be in legacy format): {}",
+                e
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Check if the vector index exists and is usable
+pub async fn has_vector_index(conn: &Connection) -> bool {
+    let rows = conn
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_embeddings_vector'",
+            (),
+        )
+        .await;
+
+    match rows {
+        Ok(mut rows) => {
+            if let Ok(Some(row)) = rows.next().await {
+                row.get::<i64>(0).unwrap_or(0) > 0
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libsql::Builder;
 
-    #[test]
-    fn test_schema_creation() {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn test_schema_creation() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        ensure_schema(&conn).await.unwrap();
 
         // Verify tables exist
-        let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                (),
+            )
+            .await
             .unwrap();
+
+        let mut tables = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            tables.push(row.get::<String>(0).unwrap());
+        }
 
         assert!(tables.contains(&"content".to_string()));
         assert!(tables.contains(&"documents".to_string()));
@@ -175,39 +295,45 @@ mod tests {
         assert!(tables.contains(&"index_state".to_string()));
     }
 
-    #[test]
-    fn test_schema_version() {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn test_schema_version() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        ensure_schema(&conn).await.unwrap();
 
-        let version: i64 = conn
-            .query_row(
+        let mut rows = conn
+            .query(
                 "SELECT CAST(value AS INTEGER) FROM index_state WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
+                (),
             )
+            .await
             .unwrap();
+
+        let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
 
         assert_eq!(version, SCHEMA_VERSION);
     }
 
-    #[test]
-    fn test_idempotent_schema() {
-        let conn = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_idempotent_schema() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
 
         // Call ensure_schema multiple times
-        ensure_schema(&conn).unwrap();
-        ensure_schema(&conn).unwrap();
-        ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).await.unwrap();
+        ensure_schema(&conn).await.unwrap();
+        ensure_schema(&conn).await.unwrap();
 
         // Should still work
-        let version: i64 = conn
-            .query_row(
+        let mut rows = conn
+            .query(
                 "SELECT CAST(value AS INTEGER) FROM index_state WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
+                (),
             )
+            .await
             .unwrap();
+
+        let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
 
         assert_eq!(version, SCHEMA_VERSION);
     }

@@ -12,7 +12,7 @@ use std::io::Write;
 use tempfile::tempdir;
 
 /// Create a test store with fixture documents
-fn create_test_store() -> (Store, tempfile::TempDir, tempfile::TempDir) {
+async fn create_test_store() -> (Store, tempfile::TempDir, tempfile::TempDir) {
     let db_dir = tempdir().unwrap();
     let content_dir = tempdir().unwrap();
 
@@ -30,14 +30,17 @@ fn create_test_store() -> (Store, tempfile::TempDir, tempfile::TempDir) {
     }
 
     // Create store and add collection
-    let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+    let store = Store::open(db_dir.path().join("test.sqlite"))
+        .await
+        .unwrap();
     store
         .add_collection("docs", content_dir.path().to_str().unwrap(), &["**/*.md"])
+        .await
         .unwrap();
 
     // Index the collection
     let indexer = Indexer::new(&store);
-    let stats = indexer.index_collection("docs").unwrap();
+    let stats = indexer.index_collection("docs").await.unwrap();
     assert_eq!(stats.files_indexed, 3);
 
     (store, db_dir, content_dir)
@@ -105,9 +108,9 @@ Backend technologies handle server-side logic including Node.js, Python, Django,
 Common database choices include PostgreSQL, MongoDB, Redis, and SQLite.
 "#;
 
-#[test]
-fn test_basic_search() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_basic_search() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
     let results = searcher
@@ -119,6 +122,7 @@ fn test_basic_search() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     // Should find the Rust guide
@@ -132,9 +136,9 @@ fn test_basic_search() {
     );
 }
 
-#[test]
-fn test_search_ranking() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_ranking() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -148,6 +152,7 @@ fn test_search_ranking() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(!results.is_empty(), "Should find results for 'python'");
@@ -168,9 +173,9 @@ fn test_search_ranking() {
     }
 }
 
-#[test]
-fn test_search_multiple_terms() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_multiple_terms() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -184,6 +189,7 @@ fn test_search_multiple_terms() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(
@@ -196,9 +202,9 @@ fn test_search_multiple_terms() {
     );
 }
 
-#[test]
-fn test_search_no_results() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_no_results() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -212,6 +218,7 @@ fn test_search_no_results() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(
@@ -220,9 +227,9 @@ fn test_search_no_results() {
     );
 }
 
-#[test]
-fn test_search_case_insensitive() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_case_insensitive() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -236,6 +243,7 @@ fn test_search_case_insensitive() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     let results_upper = searcher
@@ -247,6 +255,7 @@ fn test_search_case_insensitive() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -256,9 +265,9 @@ fn test_search_case_insensitive() {
     );
 }
 
-#[test]
-fn test_search_with_limit() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_with_limit() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -272,14 +281,15 @@ fn test_search_with_limit() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(results.len() <= 1, "Should respect limit parameter");
 }
 
-#[test]
-fn test_search_collection_filter() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_collection_filter() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -294,6 +304,7 @@ fn test_search_collection_filter() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(
@@ -312,6 +323,7 @@ fn test_search_collection_filter() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(
@@ -320,9 +332,9 @@ fn test_search_collection_filter() {
     );
 }
 
-#[test]
-fn test_search_score_normalization() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_score_normalization() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -335,6 +347,7 @@ fn test_search_score_normalization() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     // All scores should be between 0 and 1
@@ -359,9 +372,9 @@ fn test_search_score_normalization() {
     }
 }
 
-#[test]
-fn test_search_snippet_generation() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_snippet_generation() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -374,6 +387,7 @@ fn test_search_snippet_generation() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     // Should have snippets with matches highlighted
@@ -393,9 +407,9 @@ fn test_search_snippet_generation() {
     }
 }
 
-#[test]
-fn test_prefix_matching() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_prefix_matching() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
 
@@ -409,13 +423,14 @@ fn test_prefix_matching() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(!results.is_empty(), "Prefix search should find matches");
 }
 
-#[test]
-fn test_incremental_indexing() {
+#[tokio::test]
+async fn test_incremental_indexing() {
     let db_dir = tempdir().unwrap();
     let content_dir = tempdir().unwrap();
 
@@ -427,19 +442,22 @@ fn test_incremental_indexing() {
             .unwrap();
     }
 
-    let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+    let store = Store::open(db_dir.path().join("test.sqlite"))
+        .await
+        .unwrap();
     store
         .add_collection("test", content_dir.path().to_str().unwrap(), &["**/*.md"])
+        .await
         .unwrap();
 
     let indexer = Indexer::new(&store);
 
     // First index
-    let stats1 = indexer.index_collection("test").unwrap();
+    let stats1 = indexer.index_collection("test").await.unwrap();
     assert_eq!(stats1.files_indexed, 1);
 
     // Re-index without changes (should skip)
-    let stats2 = indexer.index_collection("test").unwrap();
+    let stats2 = indexer.index_collection("test").await.unwrap();
     assert_eq!(stats2.files_indexed, 0);
     assert_eq!(stats2.files_skipped, 1);
 
@@ -451,7 +469,7 @@ fn test_incremental_indexing() {
     }
 
     // Re-index with changes (should index)
-    let stats3 = indexer.index_collection("test").unwrap();
+    let stats3 = indexer.index_collection("test").await.unwrap();
     assert_eq!(stats3.files_indexed, 1);
 
     // Verify search reflects update
@@ -465,6 +483,7 @@ fn test_incremental_indexing() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(!results.is_empty(), "Should find updated content");
@@ -474,9 +493,9 @@ fn test_incremental_indexing() {
 // Document ID (docid) Tests
 // =============================================================================
 
-#[test]
-fn test_search_results_include_docid() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_search_results_include_docid() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     let searcher = qfs::search::Searcher::new(&store);
     let results = searcher
@@ -488,6 +507,7 @@ fn test_search_results_include_docid() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(!results.is_empty(), "Should find results for 'rust'");
@@ -511,22 +531,23 @@ fn test_search_results_include_docid() {
     }
 }
 
-#[test]
-fn test_get_document_by_docid() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_get_document_by_docid() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     // First, get a document to find its hash
-    let doc = store.get_document("docs", "rust_guide.md").unwrap();
+    let doc = store.get_document("docs", "rust_guide.md").await.unwrap();
     let short_id = qfs::store::get_docid(&doc.hash);
 
     // Now retrieve by docid with # prefix
     let found = store
         .get_document_by_docid(&format!("#{}", short_id))
+        .await
         .unwrap();
     assert_eq!(found.path, "rust_guide.md");
 
     // Also works without # prefix
-    let found = store.get_document_by_docid(short_id).unwrap();
+    let found = store.get_document_by_docid(short_id).await.unwrap();
     assert_eq!(found.path, "rust_guide.md");
 }
 
@@ -666,7 +687,7 @@ fn test_add_line_numbers_from_offset() {
 // Multi-get with Patterns Tests
 // =============================================================================
 
-fn setup_multi_get_store() -> (Store, tempfile::TempDir, tempfile::TempDir) {
+async fn setup_multi_get_store() -> (Store, tempfile::TempDir, tempfile::TempDir) {
     let db_dir = tempdir().unwrap();
     let content_dir = tempdir().unwrap();
 
@@ -694,22 +715,25 @@ fn setup_multi_get_store() -> (Store, tempfile::TempDir, tempfile::TempDir) {
     let mut large_file = File::create(&large_path).unwrap();
     large_file.write_all(large_content.as_bytes()).unwrap();
 
-    let store = Store::open(db_dir.path().join("test.sqlite")).unwrap();
+    let store = Store::open(db_dir.path().join("test.sqlite"))
+        .await
+        .unwrap();
     store
         .add_collection("test", content_dir.path().to_str().unwrap(), &["**/*"])
+        .await
         .unwrap();
 
     let indexer = Indexer::new(&store);
-    indexer.index_collection("test").unwrap();
+    indexer.index_collection("test").await.unwrap();
 
     (store, db_dir, content_dir)
 }
 
-#[test]
-fn test_multi_get_glob_pattern() {
-    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+#[tokio::test]
+async fn test_multi_get_glob_pattern() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store().await;
 
-    let results = store.multi_get("test/**/*.md", 10240, None).unwrap();
+    let results = store.multi_get("test/**/*.md", 10240, None).await.unwrap();
 
     assert_eq!(results.len(), 2, "Should find 2 .md files");
     assert!(
@@ -722,12 +746,13 @@ fn test_multi_get_glob_pattern() {
     );
 }
 
-#[test]
-fn test_multi_get_comma_separated() {
-    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+#[tokio::test]
+async fn test_multi_get_comma_separated() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store().await;
 
     let results = store
         .multi_get("test/docs/readme.md, test/docs/guide.md", 10240, None)
+        .await
         .unwrap();
 
     assert_eq!(results.len(), 2);
@@ -735,12 +760,15 @@ fn test_multi_get_comma_separated() {
     assert!(results.iter().any(|r| r.path == "test/docs/guide.md"));
 }
 
-#[test]
-fn test_multi_get_max_bytes_skips_large_files() {
-    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+#[tokio::test]
+async fn test_multi_get_max_bytes_skips_large_files() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store().await;
 
     // Use a small max_bytes to trigger skipping
-    let results = store.multi_get("test/docs/**/*", 1024, None).unwrap();
+    let results = store
+        .multi_get("test/docs/**/*", 1024, None)
+        .await
+        .unwrap();
 
     // The large.txt file should be skipped
     let large = results.iter().find(|r| r.path.contains("large"));
@@ -754,13 +782,14 @@ fn test_multi_get_max_bytes_skips_large_files() {
     );
 }
 
-#[test]
-fn test_multi_get_max_lines_truncates() {
-    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+#[tokio::test]
+async fn test_multi_get_max_lines_truncates() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store().await;
 
     // Get a file with max 1 line
     let results = store
         .multi_get("test/docs/readme.md", 10240, Some(1))
+        .await
         .unwrap();
 
     assert_eq!(results.len(), 1);
@@ -771,12 +800,13 @@ fn test_multi_get_max_lines_truncates() {
     );
 }
 
-#[test]
-fn test_multi_get_no_matches() {
-    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+#[tokio::test]
+async fn test_multi_get_no_matches() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store().await;
 
     let results = store
         .multi_get("nonexistent/**/*.xyz", 10240, None)
+        .await
         .unwrap();
 
     assert!(results.is_empty(), "Should return empty for no matches");
@@ -786,20 +816,20 @@ fn test_multi_get_no_matches() {
 // Ls Command Tests
 // =============================================================================
 
-#[test]
-fn test_list_collections() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_list_collections() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
-    let collections = store.list_collections().unwrap();
+    let collections = store.list_collections().await.unwrap();
     assert_eq!(collections.len(), 1);
     assert_eq!(collections[0].name, "docs");
 }
 
-#[test]
-fn test_list_files_in_collection() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_list_files_in_collection() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
-    let files = store.list_files("docs", None).unwrap();
+    let files = store.list_files("docs", None).await.unwrap();
     assert_eq!(files.len(), 3, "Should have 3 files");
 
     // All files should have required fields
@@ -810,12 +840,12 @@ fn test_list_files_in_collection() {
     }
 }
 
-#[test]
-fn test_list_files_with_path_prefix() {
-    let (store, _db_dir, _content_dir) = setup_multi_get_store();
+#[tokio::test]
+async fn test_list_files_with_path_prefix() {
+    let (store, _db_dir, _content_dir) = setup_multi_get_store().await;
 
     // List only files in docs directory
-    let files = store.list_files("test", Some("docs")).unwrap();
+    let files = store.list_files("test", Some("docs")).await.unwrap();
 
     // Should find files under docs/
     assert!(!files.is_empty());
@@ -825,11 +855,11 @@ fn test_list_files_with_path_prefix() {
     );
 }
 
-#[test]
-fn test_list_files_nonexistent_collection() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_list_files_nonexistent_collection() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
-    let files = store.list_files("nonexistent", None).unwrap();
+    let files = store.list_files("nonexistent", None).await.unwrap();
     assert!(files.is_empty());
 }
 
@@ -837,120 +867,152 @@ fn test_list_files_nonexistent_collection() {
 // Context System Tests
 // =============================================================================
 
-#[test]
-fn test_set_and_get_global_context() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_set_and_get_global_context() {
+    let store = Store::open_memory().await.unwrap();
 
     store
         .set_context(None, "/", "Global context for all files")
+        .await
         .unwrap();
 
-    let ctx = store.get_global_context().unwrap();
+    let ctx = store.get_global_context().await.unwrap();
     assert_eq!(ctx, Some("Global context for all files".to_string()));
 }
 
-#[test]
-fn test_set_and_find_collection_context() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_set_and_find_collection_context() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("docs", "/tmp/docs", &["**/*.md"])
+        .await
         .unwrap();
 
     // Set hierarchical contexts
-    store.set_context(Some("docs"), "/", "Documentation").unwrap();
+    store
+        .set_context(Some("docs"), "/", "Documentation")
+        .await
+        .unwrap();
     store
         .set_context(Some("docs"), "/api", "API reference")
+        .await
         .unwrap();
     store
         .set_context(Some("docs"), "/api/v2", "API v2 docs")
+        .await
         .unwrap();
 
     // Most specific match wins
     let ctx = store
         .find_context_for_path("docs", "/api/v2/endpoints.md")
+        .await
         .unwrap();
     assert_eq!(ctx, Some("API v2 docs".to_string()));
 
     let ctx = store
         .find_context_for_path("docs", "/api/v1/old.md")
+        .await
         .unwrap();
     assert_eq!(ctx, Some("API reference".to_string()));
 
-    let ctx = store.find_context_for_path("docs", "/readme.md").unwrap();
+    let ctx = store
+        .find_context_for_path("docs", "/readme.md")
+        .await
+        .unwrap();
     assert_eq!(ctx, Some("Documentation".to_string()));
 }
 
-#[test]
-fn test_context_longest_prefix_matching() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_context_longest_prefix_matching() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("code", "/tmp/code", &["**/*.rs"])
+        .await
         .unwrap();
 
-    store.set_context(Some("code"), "/", "Rust codebase").unwrap();
+    store
+        .set_context(Some("code"), "/", "Rust codebase")
+        .await
+        .unwrap();
     store
         .set_context(Some("code"), "/src", "Source files")
+        .await
         .unwrap();
     store
         .set_context(Some("code"), "/src/handlers", "HTTP handlers")
+        .await
         .unwrap();
 
     // Should match the longest prefix
     let ctx = store
         .find_context_for_path("code", "/src/handlers/auth.rs")
+        .await
         .unwrap();
     assert_eq!(ctx, Some("HTTP handlers".to_string()));
 
     // Falls back to shorter prefix when no exact match
     let ctx = store
         .find_context_for_path("code", "/src/models/user.rs")
+        .await
         .unwrap();
     assert_eq!(ctx, Some("Source files".to_string()));
 }
 
-#[test]
-fn test_global_context_fallback() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_global_context_fallback() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("docs", "/tmp/docs", &["**/*.md"])
+        .await
         .unwrap();
 
     store
         .set_context(None, "/", "Global fallback context")
+        .await
         .unwrap();
 
     // Collection has no specific context, should fallback to global
     let ctx = store
         .find_context_for_path("docs", "/any/path.md")
+        .await
         .unwrap();
     assert_eq!(ctx, Some("Global fallback context".to_string()));
 }
 
-#[test]
-fn test_get_all_contexts_for_path() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_get_all_contexts_for_path() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("docs", "/tmp/docs", &["**/*.md"])
+        .await
         .unwrap();
 
-    store.set_context(None, "/", "Global").unwrap();
-    store.set_context(Some("docs"), "/", "Docs").unwrap();
-    store.set_context(Some("docs"), "/api", "API").unwrap();
+    store.set_context(None, "/", "Global").await.unwrap();
+    store
+        .set_context(Some("docs"), "/", "Docs")
+        .await
+        .unwrap();
+    store
+        .set_context(Some("docs"), "/api", "API")
+        .await
+        .unwrap();
 
     // Get all matching contexts (general to specific)
     let contexts = store
         .get_all_contexts_for_path("docs", "/api/file.md")
+        .await
         .unwrap();
     assert_eq!(contexts, vec!["Global", "Docs", "API"]);
 }
 
-#[test]
-fn test_context_appears_in_search_results() {
-    let (store, _db_dir, _content_dir) = create_test_store();
+#[tokio::test]
+async fn test_context_appears_in_search_results() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
 
     // Set context for the collection
     store
         .set_context(Some("docs"), "/", "Programming guides")
+        .await
         .unwrap();
 
     let searcher = qfs::search::Searcher::new(&store);
@@ -963,6 +1025,7 @@ fn test_context_appears_in_search_results() {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
     assert!(!results.is_empty());
@@ -982,28 +1045,35 @@ fn test_context_appears_in_search_results() {
     }
 }
 
-#[test]
-fn test_remove_context() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_remove_context() {
+    let store = Store::open_memory().await.unwrap();
     store
         .set_context(Some("docs"), "/api", "API context")
+        .await
         .unwrap();
 
     // Remove should succeed
-    assert!(store.remove_context(Some("docs"), "/api").unwrap());
+    assert!(store.remove_context(Some("docs"), "/api").await.unwrap());
 
     // Second remove should return false (already removed)
-    assert!(!store.remove_context(Some("docs"), "/api").unwrap());
+    assert!(!store.remove_context(Some("docs"), "/api").await.unwrap());
 }
 
-#[test]
-fn test_list_contexts() {
-    let store = Store::open_memory().unwrap();
-    store.set_context(None, "/", "Global").unwrap();
-    store.set_context(Some("docs"), "/", "Docs").unwrap();
-    store.set_context(Some("docs"), "/api", "API").unwrap();
+#[tokio::test]
+async fn test_list_contexts() {
+    let store = Store::open_memory().await.unwrap();
+    store.set_context(None, "/", "Global").await.unwrap();
+    store
+        .set_context(Some("docs"), "/", "Docs")
+        .await
+        .unwrap();
+    store
+        .set_context(Some("docs"), "/api", "API")
+        .await
+        .unwrap();
 
-    let contexts = store.list_contexts().unwrap();
+    let contexts = store.list_contexts().await.unwrap();
     assert_eq!(contexts.len(), 3);
 
     // First should be global (sorted)
@@ -1012,32 +1082,134 @@ fn test_list_contexts() {
     assert_eq!(contexts[0].context, "Global");
 }
 
-#[test]
-fn test_delete_context() {
-    let store = Store::open_memory().unwrap();
-    store.set_context(None, "/", "Global").unwrap();
+#[tokio::test]
+async fn test_delete_context() {
+    let store = Store::open_memory().await.unwrap();
+    store.set_context(None, "/", "Global").await.unwrap();
 
-    let removed = store.remove_context(None, "/").unwrap();
+    let removed = store.remove_context(None, "/").await.unwrap();
     assert!(removed);
 
-    let ctx = store.get_global_context().unwrap();
+    let ctx = store.get_global_context().await.unwrap();
     assert_eq!(ctx, None);
 }
 
-#[test]
-fn test_get_collections_without_context() {
-    let store = Store::open_memory().unwrap();
+#[tokio::test]
+async fn test_get_collections_without_context() {
+    let store = Store::open_memory().await.unwrap();
     store
         .add_collection("docs", "/tmp/docs", &["**/*.md"])
+        .await
         .unwrap();
     store
         .add_collection("code", "/tmp/code", &["**/*.rs"])
+        .await
         .unwrap();
 
     // Add context only to docs
-    store.set_context(Some("docs"), "/", "Docs").unwrap();
+    store
+        .set_context(Some("docs"), "/", "Docs")
+        .await
+        .unwrap();
 
-    let without = store.get_collections_without_context().unwrap();
+    let without = store.get_collections_without_context().await.unwrap();
     assert_eq!(without.len(), 1);
     assert_eq!(without[0].name, "code");
+}
+
+// =============================================================================
+// Vector Index Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_ensure_vector_index_no_embeddings() {
+    let store = Store::open_memory().await.unwrap();
+
+    // Should return false when no embeddings exist
+    let created = store.ensure_vector_index().await.unwrap();
+    assert!(!created, "Should not create index when no embeddings exist");
+}
+
+#[tokio::test]
+async fn test_vector_search_fallback() {
+    let store = Store::open_memory().await.unwrap();
+
+    // Add collection and document
+    store
+        .add_collection("test", "/tmp/test", &["**/*.md"])
+        .await
+        .unwrap();
+    store
+        .insert_content("hash123", b"Test content", "text/plain")
+        .await
+        .unwrap();
+    store
+        .upsert_document("test", "file.md", Some("Title"), "hash123", ".md", "Test")
+        .await
+        .unwrap();
+
+    // Create a mock embedding (384 dimensions as f32 bytes)
+    let embedding: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+    let embedding_bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    // Insert embedding
+    store
+        .insert_embedding("hash123", 0, 0, "test-model", &embedding_bytes)
+        .await
+        .unwrap();
+
+    // Native vector search may not be available (depends on libsql version and data format)
+    // But the legacy fallback should always work
+    let results = store
+        .search_vector_legacy(&embedding, None, 10, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1, "Legacy search should find the embedding");
+    assert!(
+        results[0].similarity > 0.99,
+        "Self-similarity should be ~1.0"
+    );
+}
+
+#[tokio::test]
+async fn test_search_with_date_filter() {
+    let (store, _db_dir, _content_dir) = create_test_store().await;
+
+    // Search without date filter should return results
+    let results = store
+        .search_bm25("rust", None, 10, false, None, None)
+        .await
+        .unwrap();
+    assert!(!results.is_empty(), "Should find results without date filter");
+
+    // Search with future from_date should return no results (documents were created "now")
+    let results = store
+        .search_bm25("rust", None, 10, false, Some("2099-01-01"), None)
+        .await
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "Should not find results with future from_date"
+    );
+
+    // Search with past to_date should return no results
+    let results = store
+        .search_bm25("rust", None, 10, false, None, Some("2000-01-01"))
+        .await
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "Should not find results with past to_date"
+    );
+
+    // Search with valid date range covering "now" should return results
+    let results = store
+        .search_bm25("rust", None, 10, false, Some("2020-01-01"), Some("2099-12-31"))
+        .await
+        .unwrap();
+    assert!(
+        !results.is_empty(),
+        "Should find results within valid date range"
+    );
 }

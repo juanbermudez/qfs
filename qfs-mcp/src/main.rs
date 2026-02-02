@@ -64,7 +64,8 @@ struct Args {
     verbose: bool,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging to stderr (MCP uses stdout for protocol)
@@ -94,8 +95,8 @@ fn main() -> Result<()> {
     );
 
     // Create and run the MCP server
-    let server = McpServer::new(&db_path)?;
-    server.run()?;
+    let server = McpServer::new(&db_path).await?;
+    server.run().await?;
 
     Ok(())
 }
@@ -121,12 +122,12 @@ mod tests {
         assert!(args.verbose);
     }
 
-    #[test]
-    fn test_server_creation_with_temp_db() {
+    #[tokio::test]
+    async fn test_server_creation_with_temp_db() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite");
 
-        let server = McpServer::new(&db_path);
+        let server = McpServer::new(&db_path).await;
         assert!(server.is_ok(), "Server should be created successfully");
     }
 }

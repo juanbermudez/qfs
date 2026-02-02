@@ -8,8 +8,8 @@ description = "QFS core library - file indexing, search, and MCP server"
 readme = "../README.md"
 
 [dependencies]
-# SQLite with FTS5
-rusqlite = { workspace = true }
+# SQLite via libsql (async, FTS5, native vector search)
+libsql = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
