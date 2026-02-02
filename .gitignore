@@ -38,5 +38,11 @@ CLAUDE.md
 IMPLEMENTATION_PLAN.md
 *.skill
 
-# Embedding cache
+# Embedding cache and ML models
 .fastembed_cache/
+*.onnx
+*.safetensors
+*.gguf
+*.ggml
+*.pt
+*.pth
