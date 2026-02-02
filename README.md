@@ -479,6 +479,47 @@ embeddings      -- Vector embeddings for semantic search
 | **Binary Size** | ~3GB (with models) | ~15MB |
 | **Startup Time** | Slower (model loading) | Instant |
 
+## Claude Code Plugin
+
+QFS is available as a Claude Code plugin for seamless integration:
+
+```
+qfs-plugin/
+├── .claude-plugin/plugin.json  # Plugin manifest
+├── .mcp.json                   # MCP server configuration
+└── skills/qfs-agent/           # Agent skill with guidance
+```
+
+### Installation
+
+1. Install the QFS CLI (must be in PATH):
+```sh
+cargo install --path qfs-cli
+```
+
+2. Install the plugin:
+```sh
+# Local installation
+claude --plugin-dir ./qfs-plugin
+
+# Or via marketplace (when published)
+/plugin install qfs
+```
+
+The plugin provides:
+- **MCP Tools**: `qfs_search`, `qfs_vsearch`, `qfs_query`, `qfs_get`, `qfs_multi_get`, `qfs_status`
+- **Skill**: Agent guidance for effective QFS usage
+
+### Distribution Options
+
+| Option | Description |
+|--------|-------------|
+| **Plugin + CLI** | Users install CLI separately, plugin configures MCP server |
+| **Bundled Binary** | Plugin includes platform-specific binaries in `bin/` |
+| **Marketplace** | Publish to plugin marketplace for `/plugin install qfs` |
+
+See `qfs-plugin/README.md` for detailed distribution instructions.
+
 ## License
 
 MIT
